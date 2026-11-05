@@ -1,9 +1,11 @@
 package com.example.dianzicheng.data.repository
 
+import com.example.dianzicheng.data.local.AppLogger
+import com.example.dianzicheng.data.local.MeasurementEntity
 import com.example.dianzicheng.data.local.ScaleDao
 import com.example.dianzicheng.data.local.toDomain
 import com.example.dianzicheng.data.local.toEntity
-import com.example.dianzicheng.domain.BodyAlgorithmType
+import com.example.dianzicheng.domain.BodyAlgorithm
 import com.example.dianzicheng.domain.BodyMeasurement
 import com.example.dianzicheng.domain.FamilyMember
 import kotlinx.coroutines.flow.Flow
@@ -78,8 +80,7 @@ class ScaleRepository(private val dao: ScaleDao) {
                 impedanceOhm = measurement.impedanceOhm,
                 sex = memberToBind.sex,
                 heightCm = memberToBind.heightCm,
-                birthDateEpochMs = memberToBind.birthDateEpochMs,
-                measuredAtEpochMs = measurement.measuredAtEpochMs
+                birthDateEpochMs = memberToBind.birthDateEpochMs
             ).copy(
                 // 使用传入的 existingId 保证同次称量幂等写入，否则生成新 UUID
                 id = existingId ?: measurement.id.ifEmpty { UUID.randomUUID().toString() },
@@ -115,85 +116,128 @@ class ScaleRepository(private val dao: ScaleDao) {
     /**
      * 将已有测量记录重新绑定到指定成员，并以该成员参数重新计算 BIA 指标后写库。
      *
-     * 常用于：用户在称重结果卡片中手动选择"重选/绑定成员"时调用。
+     * 使用场景：
+     * 1. 称重结果卡片上手动「重选/绑定成员」；
+     * 2. 历史列表里点成员名改绑（自动匹配错人时的补救手段）。
+     *
+     * 重算口径与 [recalculateMeasurement] 完全一致：用目标成员的性别、身高、生日
+     * 重新跑一遍 [BodyAlgorithm.calculate]，**全部 12 项派生指标**（BMI / 体脂率 /
+     * 水分 / 蛋白质 / 骨量 / 肌肉 / 骨骼肌 / 基础代谢 / 皮下脂肪 / 内脏脂肪 /
+     * 身体年龄）都会刷新；体重、阻抗、称重时间、记录 ID 保持不变。
      *
      * @param measurement 要重新绑定的原始测量记录
      * @param member 用户选择的目标成员
      * @return 重新计算后的测量记录
      */
     suspend fun bindMeasurementToMember(measurement: BodyMeasurement, member: FamilyMember): BodyMeasurement {
-        val recalculated = com.example.dianzicheng.domain.BodyAlgorithm.calculate(
-            weightKg = measurement.weightKg,
-            impedanceOhm = measurement.impedanceOhm,
-            sex = member.sex,
-            heightCm = member.heightCm,
-            birthDateEpochMs = member.birthDateEpochMs,
-            measuredAtEpochMs = measurement.measuredAtEpochMs
-        ).copy(
-            id = measurement.id,
-            recalcCount = measurement.recalcCount + (if (measurement.memberId != member.id) 1 else 0),
-            measuredAtEpochMs = measurement.measuredAtEpochMs,
-            memberId = member.id,
-            memberNameSnapshot = member.name
-        )
+        val recalculated = rebindMeasurement(measurement, member)
         dao.insertMeasurement(recalculated.toEntity())
-        // 同步更新成员参考体重
-        dao.insertMember(member.copy(referenceWeightKg = measurement.weightKg).toEntity())
+
+        // 同步成员参考体重，供下次自动匹配使用。
+        // 仅当这条记录就是该成员的最新一条时才更新：改绑几个月前的历史记录时，
+        // 若拿旧体重覆盖参考值，会让下一次智能匹配直接认错人。
+        val latest = dao.getLatestMeasurementForMember(member.id)
+        if (shouldRefreshReferenceWeight(latest?.id, measurement.id)) {
+            dao.insertMember(member.copy(referenceWeightKg = measurement.weightKg).toEntity())
+        }
+
         return recalculated
     }
 
     /**
-     * 以成员当前资料（性别/身高/出生日期）和指定算法，重算该成员名下的全部历史记录。
+     * 用当前成员档案与当前版体成分算法，**一次性重算全部历史记录**。
      *
-     * 年龄按每条记录的称重时刻推算；原始体重、阻抗、时间、成员绑定保持不变，
-     * 并记录重算次数与时间，便于追溯。无阻抗的记录仅刷新 BMI。
+     * 使用场景：体成分公式修正后，把用旧公式落库的历史记录刷新成新口径，
+     * 避免趋势图上出现「升级那天断崖式跳变」。由设置页的按钮手动触发，幂等可重复执行。
      *
-     * @return 实际被更新的记录数
+     * 处理规则（对应历史数据里存在的两类「不该重算」的记录）：
+     * - `memberId` 为空：没有性别 / 身高 / 生日，无法可信重算 BIA，原样保留；
+     * - `impedanceOhm <= 0` 或体重 < 3kg：本来就没有阻抗数据，重算也只会得到 0，原样保留。
+     *
+     * 重算时**只覆盖派生指标**（BMI / 体脂率 / 水分 / 蛋白质 / 骨量 / 肌肉量），
+     * 原始测量量（体重、阻抗、称重时间、记录 ID、成员绑定、成员姓名快照）全部保留。
+     *
+     * 注意：使用的是成员**当前**档案；若成员在称重之后改过身高，重算结果会按新身高计算。
+     *
+     * @return 重算统计，见 [RecalcSummary]
      */
-    suspend fun recalculateForMember(member: FamilyMember, algorithm: BodyAlgorithmType): Int {
-        val list = dao.getAllMeasurementsList().filter { it.memberId == member.id }
-        return recalcList(list.map { it.toDomain() }, mapOf(member.id to member), algorithm)
+    suspend fun recalculateAllMeasurements(): RecalcSummary {
+        val members = dao.getMembersList().map { it.toDomain() }.associateBy { it.id }
+        val all = dao.getAllMeasurementsList()
+
+        val summary = recalcEntities(all, members)
+        AppLogger.i("ScaleRepository", "历史体成分重算完成：${summary.describe()}")
+        return summary
     }
 
     /**
-     * 以各成员当前资料和指定算法重算全部历史记录（未绑定成员的记录跳过）。
+     * 只重算某一位成员的历史记录。
      *
-     * @return 实际被更新的记录数
+     * 使用场景：在「我的 - 成员管理」里修改了成员的性别 / 身高 / 年龄。
+     * 这三项是体成分公式的直接输入，改完若不重算，该成员的历史数值就会停留在旧档案口径
+     * （例如把年龄从 25 改成 40，身体年龄、内脏脂肪、基础代谢全都该变）。
+     * 由 [ProfileViewModel.updateMember] 自动调用，无需用户再手动点一次「重新计算」。
+     *
+     * 只扫描该成员的记录，不会牵连其他成员，即使家里有多人也不受影响。
+     *
+     * @param memberId 成员 ID
+     * @return 重算统计；成员不存在时返回全 0
      */
-    suspend fun recalculateAll(algorithm: BodyAlgorithmType): Int {
-        val members = dao.getMembersList().map { it.toDomain() }.associateBy { it.id }
-        val list = dao.getAllMeasurementsList().map { it.toDomain() }
-        return recalcList(list, members, algorithm)
+    suspend fun recalculateMeasurementsForMember(memberId: String): RecalcSummary {
+        val member = dao.getMembersList().map { it.toDomain() }.firstOrNull { it.id == memberId }
+            ?: return RecalcSummary(0, 0, 0, 0, 0)
+        val mine = dao.getAllMeasurementsList().filter { it.memberId == memberId }
+        val summary = recalcEntities(mine, mapOf(member.id to member))
+        AppLogger.i("ScaleRepository", "成员「${member.name}」历史重算完成：${summary.describe()}")
+        return summary
     }
 
-    private suspend fun recalcList(
-        list: List<BodyMeasurement>,
-        members: Map<String, FamilyMember>,
-        algorithm: BodyAlgorithmType
-    ): Int {
-        val now = System.currentTimeMillis()
-        var changed = 0
-        for (m in list) {
-            val member = members[m.memberId ?: continue] ?: continue
-            val r = com.example.dianzicheng.domain.BodyAlgorithm.calculate(
-                weightKg = m.weightKg,
-                impedanceOhm = m.impedanceOhm,
-                sex = member.sex,
-                heightCm = member.heightCm,
-                birthDateEpochMs = member.birthDateEpochMs,
-                algorithmType = algorithm,
-                measuredAtEpochMs = m.measuredAtEpochMs
-            ).copy(
-                id = m.id,
-                memberId = m.memberId,
-                memberNameSnapshot = member.name,
-                recalcCount = m.recalcCount + 1,
-                lastRecalcAtEpochMs = now
-            )
-            dao.insertMeasurement(r.toEntity())
-            changed++
+    /**
+     * 重算一批记录的公共实现，供全量重算与单人重算共用，保证两处口径完全一致。
+     *
+     * @param entities 待重算的记录
+     * @param membersById 成员 ID → 成员档案
+     */
+    private suspend fun recalcEntities(
+        entities: List<MeasurementEntity>,
+        membersById: Map<String, FamilyMember>
+    ): RecalcSummary {
+        var updated = 0
+        var skippedNoMember = 0
+        var skippedNoImpedance = 0
+        var failed = 0
+
+        for (entity in entities) {
+            val member = entity.memberId?.let { membersById[it] }
+            if (member == null) {
+                skippedNoMember++
+                continue
+            }
+            if (!isRecalculable(entity)) {
+                skippedNoImpedance++
+                continue
+            }
+            val fresh = try {
+                recalculateMeasurement(entity, member)
+            } catch (e: Exception) {
+                AppLogger.e("ScaleRepository", "重算历史记录 ${entity.id} 失败: ${e.message}")
+                null
+            }
+            if (fresh == null) {
+                failed++
+                continue
+            }
+            dao.insertMeasurement(fresh)
+            updated++
         }
-        return changed
+
+        return RecalcSummary(
+            total = entities.size,
+            updated = updated,
+            skippedNoMember = skippedNoMember,
+            skippedNoImpedance = skippedNoImpedance,
+            failed = failed
+        )
     }
 
     /**
@@ -259,3 +303,119 @@ class ScaleRepository(private val dao: ScaleDao) {
         dao.deleteMeasurementById(id)
     }
 }
+
+/**
+ * 历史体成分重算的统计结果。
+ *
+ * @param total             扫描到的记录总数
+ * @param updated           实际重算并写回的记录数
+ * @param skippedNoMember   因未绑定成员而跳过的记录数（无性别/身高/生日，无法可信重算）
+ * @param skippedNoImpedance 因缺少有效阻抗（或体重过小）而跳过的记录数
+ * @param failed            重算过程中抛异常的记录数
+ */
+data class RecalcSummary(
+    val total: Int,
+    val updated: Int,
+    val skippedNoMember: Int,
+    val skippedNoImpedance: Int,
+    val failed: Int,
+) {
+    /** 未处理（跳过 + 失败）的记录数。 */
+    val untouched: Int get() = skippedNoMember + skippedNoImpedance + failed
+
+    /** 面向用户的一句话结果，用于 Toast / 状态栏提示。 */
+    fun describe(): String = buildString {
+        append("已重算 $updated 条记录")
+        if (untouched > 0) {
+            append("，未处理 $untouched 条")
+            val reasons = buildList {
+                if (skippedNoMember > 0) add("$skippedNoMember 条未绑定成员")
+                if (skippedNoImpedance > 0) add("$skippedNoImpedance 条无阻抗数据")
+                if (failed > 0) add("$failed 条失败")
+            }
+            if (reasons.isNotEmpty()) append("（${reasons.joinToString("、")}）")
+        }
+    }
+}
+
+/**
+ * 判断一条历史记录是否具备重算条件。
+ *
+ * 只有既有有效体重、又测到过阻抗的记录才有 BIA 指标可谈；
+ * 其余记录重算只会得到 0，没有意义，直接跳过保留原值。
+ *
+ * @param entity 数据库中的测量记录
+ */
+internal fun isRecalculable(entity: MeasurementEntity): Boolean =
+    entity.weightKg >= 3.0 && entity.impedanceOhm > 0.0
+
+/**
+ * 按成员当前档案重算一条历史记录的派生指标，返回可直接写回数据库的实体。
+ *
+ * **保留字段**：记录 ID、称重时间、体重、阻抗、成员 ID、成员姓名快照。
+ * **刷新字段**：BMI、体脂率、水分率、蛋白质率、骨量、肌肉量。
+ *
+ * 抽成顶层纯函数是为了能在单元测试里脱离 Room 直接验证「原始量不被改写」。
+ *
+ * @param entity 原始测量记录
+ * @param member 该记录绑定的成员（提供性别 / 身高 / 出生日期）
+ * @return 重算后的实体，结构与 [entity] 的 ID 一致，可直接 `INSERT OR REPLACE`
+ */
+internal fun recalculateMeasurement(entity: MeasurementEntity, member: FamilyMember): MeasurementEntity =
+    BodyAlgorithm.calculate(
+        weightKg = entity.weightKg,
+        impedanceOhm = entity.impedanceOhm,
+        sex = member.sex,
+        heightCm = member.heightCm,
+        birthDateEpochMs = member.birthDateEpochMs
+    ).copy(
+        // 原始测量量一律以数据库中的值为准，算法内部的 now() / null 绑定不得覆盖
+        id = entity.id,
+        measuredAtEpochMs = entity.measuredAtEpochMs,
+        memberId = entity.memberId,
+        memberNameSnapshot = entity.memberNameSnapshot
+    ).toEntity()
+
+/**
+ * 把一条测量记录改绑到另一位成员，并按目标成员的档案重算全部派生成分。
+ *
+ * 与 [recalculateMeasurement] 的区别只在「成员归属」：
+ * - 前者保持原成员不变，只刷新算法口径；
+ * - 本函数把 `memberId` / `memberNameSnapshot` 换成目标成员，再用其性别、身高、生日重算。
+ *
+ * **保留**：记录 ID、称重时间、体重、阻抗 —— 这是既不随人而变的客观测量值。
+ * **刷新**：BMI、体脂率、水分、蛋白质、骨量、肌肉、骨骼肌、基础代谢、皮下脂肪、
+ * 内脏脂肪、身体年龄 —— 这些全都依赖成员档案，换了人就必须重算。
+ *
+ * 抽成顶层纯函数，便于单测脱离 Room 验证「改绑只改归属与派生量，不动原始量」。
+ *
+ * @param measurement 原记录
+ * @param member 目标成员
+ * @return 改绑并重算后的记录，ID 与原记录相同，可直接 `INSERT OR REPLACE`
+ */
+internal fun rebindMeasurement(measurement: BodyMeasurement, member: FamilyMember): BodyMeasurement =
+    BodyAlgorithm.calculate(
+        weightKg = measurement.weightKg,
+        impedanceOhm = measurement.impedanceOhm,
+        sex = member.sex,
+        heightCm = member.heightCm,
+        birthDateEpochMs = member.birthDateEpochMs
+    ).copy(
+        id = measurement.id,
+        measuredAtEpochMs = measurement.measuredAtEpochMs,
+        memberId = member.id,
+        memberNameSnapshot = member.name
+    )
+
+/**
+ * 判断改绑后是否应该刷新成员的参考体重。
+ *
+ * 参考体重只服务于「下次称重自动认人」，必须代表成员**最近**的体重水平。
+ * 因此只有当被改绑的这条记录就是该成员的最新记录时才更新；改绑一条几个月前的
+ * 历史记录时若拿旧体重覆盖，下一次自动匹配会整体跑偏。成员尚无任何记录时也更新。
+ *
+ * @param latestMeasurementId 该成员当前最新记录的 ID，null 表示没有任何记录
+ * @param rebindMeasurementId 本次改绑的记录 ID
+ */
+internal fun shouldRefreshReferenceWeight(latestMeasurementId: String?, rebindMeasurementId: String): Boolean =
+    latestMeasurementId == null || latestMeasurementId == rebindMeasurementId

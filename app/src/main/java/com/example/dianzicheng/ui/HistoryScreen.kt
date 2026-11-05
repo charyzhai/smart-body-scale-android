@@ -1,5 +1,6 @@
 package com.example.dianzicheng.ui
 
+import android.widget.Toast
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
@@ -17,6 +18,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -32,6 +34,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
@@ -50,11 +53,15 @@ fun HistoryContent(
     members: List<FamilyMember> = emptyList(),
     onDelete: (BodyMeasurement) -> Unit,
     onNavigateToDetail: (String) -> Unit,
+    rebindingId: String? = null,
+    onChangeMember: (BodyMeasurement, FamilyMember) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier
 ) {
     val dateFormat = remember { SimpleDateFormat("MM月dd日 HH:mm", Locale.getDefault()) }
     var selectedMemberId by remember { mutableStateOf<String?>(null) }
     var measurementToDelete by remember { mutableStateOf<BodyMeasurement?>(null) }
+    // 正在改绑成员的那条记录，null 表示没有打开选择弹窗
+    var memberPickerFor by remember { mutableStateOf<BodyMeasurement?>(null) }
 
     val filteredHistory = remember(history, selectedMemberId) {
         if (selectedMemberId == null) {
@@ -86,6 +93,19 @@ fun HistoryContent(
                 TextButton(onClick = { measurementToDelete = null }) {
                     Text("取消")
                 }
+            }
+        )
+    }
+
+    if (memberPickerFor != null) {
+        val target = memberPickerFor!!
+        MemberPickerDialog(
+            currentMemberId = target.memberId,
+            members = members,
+            onDismiss = { memberPickerFor = null },
+            onPick = { member ->
+                memberPickerFor = null
+                onChangeMember(target, member)
             }
         )
     }
@@ -176,7 +196,9 @@ fun HistoryContent(
                                 measurement = measurement,
                                 dateStr = dateFormat.format(Date(measurement.measuredAtEpochMs)),
                                 onDelete = { measurementToDelete = measurement },
-                                onNavigateToDetail = onNavigateToDetail
+                                onNavigateToDetail = onNavigateToDetail,
+                                onChangeMember = { memberPickerFor = measurement },
+                                isRebinding = measurement.id == rebindingId
                             )
                         }
                     }
@@ -191,7 +213,9 @@ fun ModernMeasurementCard(
     measurement: BodyMeasurement,
     dateStr: String,
     onDelete: () -> Unit,
-    onNavigateToDetail: (String) -> Unit
+    onNavigateToDetail: (String) -> Unit,
+    onChangeMember: () -> Unit = {},
+    isRebinding: Boolean = false
 ) {
     Card(
         modifier = Modifier
@@ -243,21 +267,51 @@ fun ModernMeasurementCard(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Member Name tag if present
-            if (measurement.memberNameSnapshot != null) {
-                Surface(
-                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f),
-                    shape = RoundedCornerShape(4.dp)
+            // 成员标签：点一下即可改绑。
+            // 自动匹配是按体重就近似判人，难免认错；这里提供逐条纠正的入口，
+            // 改绑后会用目标成员的性别/身高/年龄重算全部体成分指标。
+            val memberTagColor = if (measurement.memberNameSnapshot != null)
+                MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
+            else
+                MaterialTheme.colorScheme.surfaceVariant
+
+            val memberTagTextColor = if (measurement.memberNameSnapshot != null)
+                MaterialTheme.colorScheme.onSecondaryContainer
+            else
+                MaterialTheme.colorScheme.outline
+
+            Surface(
+                color = memberTagColor,
+                shape = RoundedCornerShape(4.dp),
+                modifier = Modifier.clickable(onClick = onChangeMember)
+            ) {
+                Row(
+                    modifier = Modifier.padding(start = 8.dp, end = 6.dp, top = 3.dp, bottom = 3.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = measurement.memberNameSnapshot,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                        text = measurement.memberNameSnapshot ?: "未绑定成员",
                         style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                        color = memberTagTextColor
                     )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    if (isRebinding) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(11.dp),
+                            strokeWidth = 1.5.dp,
+                            color = memberTagTextColor
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.Edit,
+                            contentDescription = "更改成员",
+                            modifier = Modifier.size(11.dp),
+                            tint = memberTagTextColor.copy(alpha = 0.75f)
+                        )
+                    }
                 }
-                Spacer(modifier = Modifier.height(12.dp))
             }
+            Spacer(modifier = Modifier.height(12.dp))
 
             val hasBia = measurement.impedanceOhm > 0.0 && measurement.bodyFatPct > 0.0
             Row(
@@ -284,6 +338,90 @@ fun HistoryMiniMetric(label: String, value: String, modifier: Modifier = Modifie
     Column(modifier = modifier) {
         Text(text = label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
         Text(text = value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/**
+ * 成员选择弹窗：为一条历史记录指定/更改归属成员。
+ *
+ * 列表里会标出当前绑定的成员（选中态），点击其他成员即触发改绑。
+ * 弹窗底部给出提示，说明改绑会连带重算体成分，避免用户误以为只改个名字。
+ *
+ * @param currentMemberId 当前绑定的成员 ID，null 表示未绑定
+ * @param members 可选成员列表
+ * @param onDismiss 关闭弹窗
+ * @param onPick 选中成员后的回调
+ */
+@Composable
+fun MemberPickerDialog(
+    currentMemberId: String?,
+    members: List<FamilyMember>,
+    onDismiss: () -> Unit,
+    onPick: (FamilyMember) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("更改测量成员", fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text(
+                    text = "改绑后会按该成员的性别、身高、年龄重新计算体脂率、肌肉、基础代谢等全部指标。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                if (members.isEmpty()) {
+                    Text("还没有家庭成员，请先到「我的 - 成员管理」添加。", style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    Column(
+                        modifier = Modifier
+                            .heightIn(max = 320.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        members.forEach { member ->
+                            val selected = member.id == currentMemberId
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { onPick(member) }
+                                    .padding(vertical = 6.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(selected = selected, onClick = { onPick(member) })
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = member.name,
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                                    )
+                                    Text(
+                                        text = memberSubtitle(member),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.outline
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}
+
+/** 成员副标题：性别 / 身高 / 年龄，便于在弹窗里区分同名成员 */
+private fun memberSubtitle(member: FamilyMember): String {
+    val gender = if (member.sex == com.example.dianzicheng.domain.Sex.MALE) "男" else "女"
+    val age = com.example.dianzicheng.domain.AgeUtils.displayAge(member.birthDateEpochMs)
+    return buildString {
+        append(gender)
+        if (member.heightCm > 0) append(" · ${member.heightCm.toInt()}cm")
+        if (age in 1..120) append(" · $age 岁")
     }
 }
 
@@ -470,11 +608,25 @@ fun HistoryScreen(
 ) {
     val history by viewModel.history.collectAsState()
     val members by viewModel.members.collectAsState()
+    val rebindingId by viewModel.rebindingMeasurementId.collectAsState()
+    val rebindMessage by viewModel.rebindMessage.collectAsState()
+    val context = LocalContext.current
+
+    // 改绑结果 Toast 提示
+    LaunchedEffect(rebindMessage) {
+        rebindMessage?.let {
+            Toast.makeText(context, it, Toast.LENGTH_SHORT).show()
+            viewModel.clearRebindMessage()
+        }
+    }
+
     HistoryContent(
         history = history,
         members = members,
         onDelete = { viewModel.deleteMeasurement(it) },
         onNavigateToDetail = onNavigateToDetail,
+        rebindingId = rebindingId,
+        onChangeMember = { measurement, member -> viewModel.changeMeasurementMember(measurement, member) },
         modifier = modifier
     )
 }
@@ -488,6 +640,30 @@ fun MeasurementDetailScreen(
 ) {
     val history by viewModel.history.collectAsState()
     val measurement = history.find { it.id == measurementId }
+
+    val members by viewModel.members.collectAsState()
+    var showMemberPicker by remember { mutableStateOf(false) }
+    val rebindMessage by viewModel.rebindMessage.collectAsState()
+    val context = LocalContext.current
+
+    LaunchedEffect(rebindMessage) {
+        rebindMessage?.let {
+            Toast.makeText(context, it, Toast.LENGTH_SHORT).show()
+            viewModel.clearRebindMessage()
+        }
+    }
+
+    if (showMemberPicker && measurement != null) {
+        MemberPickerDialog(
+            currentMemberId = measurement.memberId,
+            members = members,
+            onDismiss = { showMemberPicker = false },
+            onPick = { member ->
+                showMemberPicker = false
+                viewModel.changeMeasurementMember(measurement, member)
+            }
+        )
+    }
 
     val dateFormat = remember { SimpleDateFormat("yyyy年MM月dd日 HH:mm:ss", Locale.getDefault()) }
 
@@ -522,17 +698,36 @@ fun MeasurementDetailScreen(
                     color = MaterialTheme.colorScheme.outline
                 )
 
-                if (measurement.memberNameSnapshot != null) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Surface(
-                        color = MaterialTheme.colorScheme.primaryContainer,
-                        shape = RoundedCornerShape(16.dp)
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    color = if (measurement.memberNameSnapshot != null)
+                        MaterialTheme.colorScheme.primaryContainer
+                    else
+                        MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.clickable { showMemberPicker = true }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "成员: ${measurement.memberNameSnapshot}",
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                            text = measurement.memberNameSnapshot?.let { "成员: $it" } ?: "未绑定成员 · 点此指定",
                             style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                            color = if (measurement.memberNameSnapshot != null)
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            else
+                                MaterialTheme.colorScheme.outline
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Icon(
+                            imageVector = Icons.Default.Edit,
+                            contentDescription = "更改成员",
+                            modifier = Modifier.size(12.dp),
+                            tint = if (measurement.memberNameSnapshot != null)
+                                MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
+                            else
+                                MaterialTheme.colorScheme.outline
                         )
                     }
                 }
@@ -581,26 +776,15 @@ fun MeasurementDetailScreen(
                         }
                         HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
                         Row(modifier = Modifier.fillMaxWidth()) {
+                            DetailGridItem("骨骼肌", if (measurement.skeletalMuscleKg > 0.0) String.format("%.1fkg", measurement.skeletalMuscleKg) else "--", modifier = Modifier.weight(1f))
+                            DetailGridItem("基础代谢", if (measurement.basalMetabolismKcal > 0.0) String.format("%.0fkcal", measurement.basalMetabolismKcal) else "--", modifier = Modifier.weight(1f))
+                            DetailGridItem("内脏脂肪", if (hasBia) String.format("%.0f级", measurement.visceralFatLevel) else "--", modifier = Modifier.weight(1f))
+                        }
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+                        Row(modifier = Modifier.fillMaxWidth()) {
+                            DetailGridItem("皮下脂肪", if (hasBia) String.format("%.1f%%", measurement.subcutaneousFatPct) else "--", modifier = Modifier.weight(1f))
+                            DetailGridItem("身体年龄", if (hasBia && measurement.bodyAge > 0) "${measurement.bodyAge}岁" else "--", modifier = Modifier.weight(1f))
                             DetailGridItem("电阻抗", if (measurement.impedanceOhm > 0.0) "${measurement.impedanceOhm.toInt()}Ω" else "未测出", modifier = Modifier.weight(1f))
-                            Spacer(modifier = Modifier.weight(2f))
-                        }
-                        if (measurement.ageUsed > 0 || measurement.algorithmId.isNotEmpty()) {
-                            HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-                            val algoName = com.example.dianzicheng.domain.BodyAlgorithmType.entries
-                                .firstOrNull { it.id == measurement.algorithmId }?.displayName ?: "未记录"
-                            Text(
-                                text = "计算依据：${measurement.ageUsed}岁 · ${measurement.heightCmUsed.toInt()}cm · $algoName",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.outline
-                            )
-                        }
-                        if (measurement.recalcCount > 0) {
-                            Text(
-                                text = "已重算 ${measurement.recalcCount} 次，最近：${dateFormat.format(Date(measurement.lastRecalcAtEpochMs))}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.outline,
-                                modifier = Modifier.padding(top = 4.dp)
-                            )
                         }
                     }
                 }

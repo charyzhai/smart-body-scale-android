@@ -60,11 +60,11 @@ enum class ScaleModel(
     ),
     OKOK_CHIPSEA(
         id = "OKOK_CHIPSEA",
-        displayName = "OKOK / 芯海科技方案 (含志高/康佳等)",
-        brand = "OKOK / 芯海科技 / 志高",
+        displayName = "OKOK / 芯海科技方案体脂秤",
+        brand = "OKOK / 芯海科技",
         category = "主流方案",
-        description = "芯海芯片常见 0x10 / 0xCF 协议帧与 0xFFF0 / 0xFFE0 透传服务（志高、康佳、奥克斯等贴牌秤常用）",
-        wakeGuidance = "请踩秤点亮屏幕，蓝牙广播名称通常包含 OKOK、Chipsea、CHIGO、志高 或 CS- 开头",
+        description = "芯海芯片常见 0x10 / 0xCF 协议帧与 0xFFF0 / 0xFFE0 透传服务",
+        wakeGuidance = "请踩秤点亮屏幕，蓝牙广播名称通常包含 OKOK、Chipsea 或 CS- 开头",
         protocolName = "OKOK/Chipsea"
     ),
     SENSSUN(
@@ -84,6 +84,15 @@ enum class ScaleModel(
         description = "AFU 0xAC 协议帧（含 0x68 基准偏移），0xFFB0 服务，需发送 0xFD 握手指令激活",
         wakeGuidance = "站上秤面唤醒，设备广播名称通常包含 AFU、WL-TZ 或 TZ-A1",
         protocolName = "AFU"
+    ),
+    AFU_BH_TZ_B1(
+        id = "AFU_BH_TZ_B1",
+        displayName = "薄荷健康 B1 体脂秤 (蚂蚁阿福联名款)",
+        brand = "薄荷健康 / 沃莱",
+        category = "专有协议",
+        description = "沃莱新固件 AFU-BH-TZ-B1：20 字节 AF 45 帧，af000002 写特征，需校时+双帧同步握手并逐帧回 ack",
+        wakeGuidance = "赤脚踩上秤面等待体重锁定；需保持连接直至阻抗回传，测量期间不要退出页面",
+        protocolName = "AFU-BH/B1"
     ),
     PHICOMM_S7(
         id = "PHICOMM_S7",

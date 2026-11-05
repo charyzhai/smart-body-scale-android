@@ -67,14 +67,13 @@ fun PairingScreen(
     var showModelDialog by remember { mutableStateOf(false) }
     var showOtherDevices by remember { mutableStateOf(false) }
 
-    // 蓝牙与定位权限配置
+    // 蓝牙（及低版本系统所需的定位）权限配置
     val requiredPermissions = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Android 12+ 只需「附近的设备」；清单已声明 neverForLocation，无需定位
             arrayOf(
                 Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION
+                Manifest.permission.BLUETOOTH_CONNECT
             )
         } else {
             arrayOf(
@@ -171,6 +170,11 @@ fun PairingScreen(
                             contentDescription = "选择特定型号偏好",
                             tint = if (uiState.selectedScaleModel != ScaleModel.AUTO) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
                         )
+                    }
+                    if (onNavigateBack == null) {
+                        TextButton(onClick = onPairingComplete) {
+                            Text("跳过", fontWeight = FontWeight.SemiBold)
+                        }
                     }
                 }
             )
@@ -761,7 +765,8 @@ private fun SearchingGuidanceCard(
             Spacer(modifier = Modifier.height(10.dp))
             Text(
                 text = "1. 大多数体脂秤熄屏时会自动休眠并关闭蓝牙，请双脚站上秤踩亮屏幕；\n" +
-                       "2. 请保持手机与体脂秤在 3 米以内，且手机蓝牙与定位服务处于开启状态；\n" +
+                       "2. 请保持手机与体脂秤在 3 米以内，并确保手机蓝牙已开启" +
+                       "（Android 11 及以下还需开启定位服务）；\n" +
                        "3. 若使用的是薄荷、小米、香山或斐讯等特定品牌，可尝试手动指定型号。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,

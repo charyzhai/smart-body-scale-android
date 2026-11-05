@@ -41,11 +41,11 @@ data class MemberEntity(
  * @param boneMassKg         骨量（公斤），无阻抗时为 0.0
  * @param memberId           关联的家庭成员 ID（外键），null 表示未绑定
  * @param memberNameSnapshot 保存时成员姓名快照，防止改名后历史混乱
- * @param ageUsed            计算时采用的年龄（称重时刻）
- * @param heightCmUsed       计算时采用的身高
- * @param algorithmId        计算时采用的算法 ID
- * @param recalcCount        重算次数
- * @param lastRecalcAtEpochMs 最近一次重算时间
+ * @param basalMetabolismKcal 基础代谢率（kcal/天），数据库 v2 新增，旧记录为 0
+ * @param skeletalMuscleKg    骨骼肌量（公斤），数据库 v2 新增，旧记录为 0
+ * @param subcutaneousFatPct  皮下脂肪率（%），数据库 v2 新增，旧记录为 0
+ * @param visceralFatLevel    内脏脂肪等级（1~30），数据库 v2 新增，旧记录为 0
+ * @param bodyAge             身体年龄（岁），数据库 v2 新增，旧记录为 0
  */
 @Entity(tableName = "measurements")
 data class MeasurementEntity(
@@ -61,9 +61,11 @@ data class MeasurementEntity(
     val boneMassKg: Double,
     val memberId: String?,
     val memberNameSnapshot: String?,
-    @ColumnInfo(defaultValue = "0") val ageUsed: Int = 0,
-    @ColumnInfo(defaultValue = "0") val heightCmUsed: Double = 0.0,
-    @ColumnInfo(defaultValue = "''") val algorithmId: String = "",
-    @ColumnInfo(defaultValue = "0") val recalcCount: Int = 0,
-    @ColumnInfo(defaultValue = "0") val lastRecalcAtEpochMs: Long = 0L
+    // 以下 5 列为数据库 v2 新增。defaultValue 必须与 MIGRATION_1_2 的 ALTER 语句一致，
+    // 否则 Room 启动时的 schema 校验会因「期望默认值 null、实际 0」而崩溃。
+    @ColumnInfo(defaultValue = "0") val basalMetabolismKcal: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val skeletalMuscleKg: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val subcutaneousFatPct: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val visceralFatLevel: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val bodyAge: Int = 0,
 )

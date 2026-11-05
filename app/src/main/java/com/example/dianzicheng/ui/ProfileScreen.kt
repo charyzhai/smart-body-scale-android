@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.Article
@@ -30,14 +31,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import com.example.dianzicheng.domain.BodyAlgorithmType
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.dianzicheng.data.local.AppLogger
+import com.example.dianzicheng.domain.AgeUtils
 import com.example.dianzicheng.domain.FamilyMember
 import com.example.dianzicheng.domain.ScaleModel
 import com.example.dianzicheng.domain.Sex
@@ -50,18 +52,15 @@ import java.util.Locale
 @Composable
 fun ProfileContent(
     members: List<FamilyMember>,
-    onAddMember: (String, Sex, Double, Long, Double) -> Unit,
+    onAddMember: (String, Sex, Double, Int) -> Unit,
+    onUpdateMember: (FamilyMember, String, Sex, Double, Int) -> Unit = { _, _, _, _, _ -> },
     onDeleteMember: (FamilyMember) -> Unit,
-    onUpdateMember: (FamilyMember) -> Unit = {},
-    onRecalculateHistory: () -> Unit = {},
     onResetPairing: () -> Unit,
     onNavigateToPairing: () -> Unit = onResetPairing,
     pairedMac: String? = null,
     pairedDeviceName: String? = null,
     selectedScaleModel: ScaleModel = ScaleModel.AUTO,
     onSelectScaleModel: (ScaleModel) -> Unit = {},
-    selectedBodyAlgorithm: BodyAlgorithmType = BodyAlgorithmType.COMMERCIAL,
-    onSelectBodyAlgorithm: (BodyAlgorithmType) -> Unit = {},
     healthConnectEnabled: Boolean,
     onToggleHealthConnect: (Boolean) -> Unit,
     onRequestHealthConnectPermissions: () -> Unit,
@@ -79,32 +78,51 @@ fun ProfileContent(
     onBackupData: () -> Unit,
     onRestoreData: () -> Unit,
     isOperating: Boolean,
+    onRecalculateHistory: () -> Unit = {},
+    recalcInProgress: Boolean = false,
     logEntries: List<AppLogger.LogEntry> = emptyList(),
     onClearLogs: () -> Unit = {},
     onShareLogs: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var showAddDialog by remember { mutableStateOf(false) }
+    var memberToEdit by remember { mutableStateOf<FamilyMember?>(null) }
+    var showEditDialog by remember { mutableStateOf(false) }
     var showWebdavDialog by remember { mutableStateOf(false) }
     var showLogDialog by remember { mutableStateOf(false) }
     var showUnpairConfirmDialog by remember { mutableStateOf(false) }
     var showModelDialog by remember { mutableStateOf(false) }
-    var showAlgorithmDialog by remember { mutableStateOf(false) }
+    var showRecalcConfirmDialog by remember { mutableStateOf(false) }
     var memberToDelete by remember { mutableStateOf<FamilyMember?>(null) }
-    var memberToEdit by remember { mutableStateOf<FamilyMember?>(null) }
-    var showRecalcConfirm by remember { mutableStateOf(false) }
 
     val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
+
+    // 直接读安装包 versionName：用户可通过标题栏版本号确认装的是不是最新 APK
+    val versionContext = LocalContext.current
+    val appVersion = remember(versionContext) {
+        runCatching {
+            versionContext.packageManager
+                .getPackageInfo(versionContext.packageName, 0).versionName
+        }.getOrNull() ?: "1.4.2"
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
-                    Text(
-                        text = "我的",
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.titleLarge
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = "我的",
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleLarge
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "v$appVersion",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 },
                 actions = {
                     IconButton(onClick = { showAddDialog = true }) {
@@ -153,8 +171,40 @@ fun ProfileContent(
                 items(members) { member ->
                     MemberCard(
                         member = member,
-                        onEdit = { memberToEdit = member },
+                        onEdit = {
+                            memberToEdit = member
+                            showEditDialog = true
+                        },
                         onDelete = { memberToDelete = member }
+                    )
+                }
+            }
+
+            // Data Maintenance Section：算法口径变更后，把历史记录刷成新公式
+            // 位置刻意放在成员管理之后，避免夹在 Health Connect / WebDAV 之间被划过去
+            item {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "数据维护",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            item {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+                ) {
+                    SettingsItem(
+                        title = "重新计算历史体成分",
+                        subtitle = "按当前公式刷新历史记录（体重、阻抗、称重时间保持不变）",
+                        icon = Icons.Default.Refresh,
+                        onClick = { showRecalcConfirmDialog = true },
+                        isLoading = recalcInProgress
                     )
                 }
             }
@@ -273,7 +323,7 @@ fun ProfileContent(
                                 fontWeight = FontWeight.Medium
                             )
                             Text(
-                                text = "小米健康通过 Health Connect 读取数据。请先开启上方\"同步至系统健康\"并授权，再点击\"立即同步\"将全部历史记录一键导入小米健康。",
+                                text = "本应用将体重与体脂写入系统 Health Connect，小米健康等支持 Health Connect 的应用可读取。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -295,7 +345,7 @@ fun ProfileContent(
                     )
                     SettingsItem(
                         title = "立即同步全部历史数据",
-                        subtitle = "体重与体脂写入 Health Connect，小米健康可直接读取",
+                        subtitle = "体重与体脂批量写入 Health Connect",
                         icon = Icons.Default.CloudSync,
                         onClick = onBatchSyncToHealthConnect,
                         isLoading = syncProgress != null
@@ -414,27 +464,6 @@ fun ProfileContent(
                         color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
                     )
                     SettingsItem(
-                        title = "体成分计算算法",
-                        subtitle = "${selectedBodyAlgorithm.displayName} · 点击切换模型",
-                        icon = Icons.Default.Calculate,
-                        onClick = { showAlgorithmDialog = true }
-                    )
-                    HorizontalDivider(
-                        modifier = Modifier.padding(horizontal = 16.dp),
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                    )
-                    SettingsItem(
-                        title = "重算历史记录",
-                        subtitle = "按当前算法与成员最新资料（年龄按称重时刻推算）重算全部历史指标",
-                        icon = Icons.Default.Refresh,
-                        onClick = { showRecalcConfirm = true },
-                        isLoading = isOperating
-                    )
-                    HorizontalDivider(
-                        modifier = Modifier.padding(horizontal = 16.dp),
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                    )
-                    SettingsItem(
                         title = "查看运行日志",
                         subtitle = if (logEntries.isEmpty()) "暂无日志" else "共 ${logEntries.size} 条记录",
                         icon = Icons.AutoMirrored.Filled.Article,
@@ -446,7 +475,7 @@ fun ProfileContent(
                     )
                     SettingsItem(
                         title = "关于软件",
-                        subtitle = "版本 1.4.1",
+                        subtitle = "版本 $appVersion",
                         icon = Icons.Default.Info,
                         onClick = { }
                     )
@@ -459,6 +488,38 @@ fun ProfileContent(
         }
     }
 
+    if (showRecalcConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showRecalcConfirmDialog = false },
+            title = { Text("重新计算历史体成分？", fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "将用当前版体成分公式，结合每位成员的性别、身高、年龄，重新计算全部历史记录中的" +
+                        "体脂率、水分率、蛋白质率、骨量、肌肉量、BMI、基础代谢、骨骼肌量、皮下脂肪率、" +
+                        "内脏脂肪等级和身体年龄。\n\n" +
+                        "体重、阻抗、称重时间不会被修改；未绑定成员或没有阻抗数据的记录会原样保留。\n\n" +
+                        "升级到 1.5.0 后，历史记录的新增指标最初都是 0，执行一次本操作即可全部回填。\n\n" +
+                        "建议先执行一次 WebDAV 备份，以便需要时恢复。"
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showRecalcConfirmDialog = false
+                        onRecalculateHistory()
+                    }
+                ) {
+                    Text("开始重算", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRecalcConfirmDialog = false }) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+
     if (showLogDialog) {
         LogViewerDialog(
             entries = logEntries,
@@ -469,41 +530,28 @@ fun ProfileContent(
     }
 
     if (showAddDialog) {
-        AddMemberDialog(
+        MemberEditDialog(
+            member = null,
             onDismiss = { showAddDialog = false },
-            onConfirm = { name, sex, height, birth, weight ->
-                onAddMember(name, sex, height, birth, weight)
+            onConfirm = { name, sex, height, age ->
+                onAddMember(name, sex, height, age)
                 showAddDialog = false
             }
         )
     }
 
-    memberToEdit?.let { target ->
-        AddMemberDialog(
-            initial = target,
-            onDismiss = { memberToEdit = null },
-            onConfirm = { name, sex, height, birth, _ ->
-                onUpdateMember(target.copy(name = name, sex = sex, heightCm = height, birthDateEpochMs = birth))
+    if (showEditDialog && memberToEdit != null) {
+        MemberEditDialog(
+            member = memberToEdit,
+            onDismiss = {
+                showEditDialog = false
                 memberToEdit = null
-            }
-        )
-    }
-
-    if (showRecalcConfirm) {
-        AlertDialog(
-            onDismissRequest = { showRecalcConfirm = false },
-            title = { Text("重算历史记录", fontWeight = FontWeight.Bold) },
-            text = {
-                Text("将按「${selectedBodyAlgorithm.displayName}」和各成员当前的性别、身高、年龄重算全部历史体成分指标。原始体重、阻抗与称重时间不会改变，重算次数会记录在每条记录上。")
             },
-            confirmButton = {
-                TextButton(onClick = {
-                    onRecalculateHistory()
-                    showRecalcConfirm = false
-                }) { Text("开始重算", fontWeight = FontWeight.Bold) }
-            },
-            dismissButton = {
-                TextButton(onClick = { showRecalcConfirm = false }) { Text("取消") }
+            onConfirm = { name, sex, height, age ->
+                val target = memberToEdit
+                if (target != null) onUpdateMember(target, name, sex, height, age)
+                showEditDialog = false
+                memberToEdit = null
             }
         )
     }
@@ -514,7 +562,7 @@ fun ProfileContent(
             onDismissRequest = { memberToDelete = null },
             title = { Text("确认删除成员", fontWeight = FontWeight.Bold) },
             text = {
-                Text("确定要删除成员「${target.name}」吗？\n删除后该成员的历史测量记录将保留，但不再关联到此成员。")
+                Text("确定要删除成员「${target.name}」吗？\n该成员的全部历史测量记录会随之一并删除，且无法撤销。如果只是资料填错，请改用「编辑」而不是删除。")
             },
             confirmButton = {
                 TextButton(
@@ -587,14 +635,6 @@ fun ProfileContent(
             currentModel = selectedScaleModel,
             onModelSelected = onSelectScaleModel,
             onDismiss = { showModelDialog = false }
-        )
-    }
-
-    if (showAlgorithmDialog) {
-        SelectBodyAlgorithmDialog(
-            currentAlgorithm = selectedBodyAlgorithm,
-            onAlgorithmSelected = onSelectBodyAlgorithm,
-            onDismiss = { showAlgorithmDialog = false }
         )
     }
 }
@@ -934,14 +974,25 @@ fun MemberCard(member: FamilyMember, onEdit: () -> Unit = {}, onDelete: () -> Un
             Column(modifier = Modifier.weight(1f)) {
                 Text(text = member.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Text(
-                    text = "${if (member.sex == Sex.MALE) "男" else "女"} · ${member.heightCm.toInt()}cm · ${com.example.dianzicheng.domain.BodyAlgorithm.ageAt(member.birthDateEpochMs)}岁",
+                    text = buildString {
+                        append(if (member.sex == Sex.MALE) "男" else "女")
+                        append(" · ${AgeUtils.displayAge(member.birthDateEpochMs)}岁")
+                        append(" · ${member.heightCm.toInt()}cm")
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            IconButton(onClick = onEdit) {
-                Icon(Icons.Default.Edit, contentDescription = "编辑", modifier = Modifier.size(20.dp))
+            IconButton(
+                onClick = onEdit,
+                colors = IconButtonDefaults.iconButtonColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f),
+                    contentColor = MaterialTheme.colorScheme.primary
+                )
+            ) {
+                Icon(Icons.Default.Edit, contentDescription = "编辑成员", modifier = Modifier.size(20.dp))
             }
+            Spacer(modifier = Modifier.width(4.dp))
             IconButton(
                 onClick = onDelete,
                 colors = IconButtonDefaults.iconButtonColors(
@@ -955,29 +1006,48 @@ fun MemberCard(member: FamilyMember, onEdit: () -> Unit = {}, onDelete: () -> Un
     }
 }
 
+/**
+ * 成员资料编辑弹窗，新增与修改共用。
+ *
+ * @param member 传入已有成员表示「编辑」，传 null 表示「新增」
+ * @param onDismiss 关闭弹窗
+ * @param onConfirm 确认回调：(姓名, 性别, 身高cm, 年龄岁)
+ *
+ * 年龄是体成分计算的关键入参（体脂率、基础代谢、内脏脂肪、身体年龄都依赖它），
+ * 此前界面上无处可改，所有成员都被硬编码成 25 岁，属于真实缺陷。此处按周岁收集，
+ * 落库时由 [AgeUtils.birthDateFromAge] 换算成出生日期，保证界面与算法口径一致。
+ */
 @Composable
-fun AddMemberDialog(
+fun MemberEditDialog(
+    member: FamilyMember? = null,
     onDismiss: () -> Unit,
-    onConfirm: (String, Sex, Double, Long, Double) -> Unit,
-    initial: FamilyMember? = null
+    onConfirm: (String, Sex, Double, Int) -> Unit
 ) {
-    val initialAge = remember(initial) {
-        initial?.let { com.example.dianzicheng.domain.BodyAlgorithm.ageAt(it.birthDateEpochMs) } ?: 25
+    val isEdit = member != null
+    var name by remember(member) { mutableStateOf(member?.name ?: "") }
+    var sex by remember(member) { mutableStateOf(member?.sex ?: Sex.MALE) }
+    var height by remember(member) {
+        mutableStateOf(member?.heightCm?.toInt()?.toString() ?: "170")
     }
-    var name by remember { mutableStateOf(initial?.name ?: "") }
-    var sex by remember { mutableStateOf(initial?.sex ?: Sex.MALE) }
-    var height by remember { mutableStateOf(initial?.heightCm?.let { if (it % 1.0 == 0.0) it.toInt().toString() else it.toString() } ?: "170") }
-    var age by remember { mutableStateOf(initialAge.toString()) }
+    var age by remember(member) {
+        mutableStateOf(member?.let { AgeUtils.displayAge(it.birthDateEpochMs).toString() } ?: "30")
+    }
+
+    val heightValue = height.toDoubleOrNull()
+    val ageValue = age.toIntOrNull()
+    val heightValid = heightValue != null && heightValue in 50.0..250.0
+    val ageValid = ageValue != null && ageValue in 1..120
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (initial == null) "添加新成员" else "编辑成员") },
+        title = { Text(if (isEdit) "编辑成员资料" else "添加新成员") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
                     label = { Text("姓名") },
+                    singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = MaterialTheme.shapes.medium
                 )
@@ -1001,21 +1071,40 @@ fun AddMemberDialog(
                     )
                 }
 
-                OutlinedTextField(
-                    value = height,
-                    onValueChange = { height = it },
-                    label = { Text("身高 (cm)") },
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = MaterialTheme.shapes.medium
-                )
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    OutlinedTextField(
+                        value = height,
+                        onValueChange = { input -> height = input.filter { it.isDigit() || it == '.' } },
+                        label = { Text("身高 (cm)") },
+                        singleLine = true,
+                        isError = height.isNotBlank() && !heightValid,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.weight(1f),
+                        shape = MaterialTheme.shapes.medium
+                    )
+                    OutlinedTextField(
+                        value = age,
+                        onValueChange = { input -> age = input.filter { it.isDigit() }.take(3) },
+                        label = { Text("年龄 (岁)") },
+                        singleLine = true,
+                        isError = age.isNotBlank() && !ageValid,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f),
+                        shape = MaterialTheme.shapes.medium
+                    )
+                }
 
-                OutlinedTextField(
-                    value = age,
-                    onValueChange = { v -> age = v.filter { it.isDigit() }.take(3) },
-                    label = { Text("年龄 (岁)") },
-                    supportingText = if (initial != null) { { Text("修改后将重算该成员的历史记录") } } else null,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = MaterialTheme.shapes.medium
+                Text(
+                    text = if (isEdit) {
+                        "性别、身高、年龄都会参与体成分计算。保存后会自动按新资料重算该成员的历史记录，体重与阻抗不变。"
+                    } else {
+                        "年龄按周岁填写，会影响体脂率、基础代谢、身体年龄的计算结果。"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline
                 )
             }
         },
@@ -1023,22 +1112,18 @@ fun AddMemberDialog(
             Button(
                 onClick = {
                     val finalName = if (name.isBlank()) "新成员" else name.trim()
-                    val ageInt = (age.toIntOrNull() ?: initialAge).coerceIn(1, 120)
-                    // 年龄未改动时保留原出生日期（避免丢失月/日精度）；否则由年龄反推
-                    val birth = if (initial != null && ageInt == initialAge) initial.birthDateEpochMs
-                        else com.example.dianzicheng.domain.BodyAlgorithm.birthDateFromAge(ageInt)
                     onConfirm(
                         finalName,
                         sex,
-                        (height.toDoubleOrNull() ?: 170.0).coerceIn(50.0, 250.0),
-                        birth,
-                        initial?.referenceWeightKg ?: 0.0
+                        heightValue ?: 170.0,
+                        ageValue ?: AgeUtils.DEFAULT_AGE
                     )
                     onDismiss()
                 },
+                enabled = heightValid && ageValid,
                 shape = MaterialTheme.shapes.medium
             ) {
-                Text("确定")
+                Text(if (isEdit) "保存" else "确定")
             }
         },
         dismissButton = {
@@ -1063,22 +1148,35 @@ fun ProfileScreen(
     val webdavPassword by viewModel.webdavPassword.collectAsState()
     val lastBackupTime by viewModel.lastBackupTime.collectAsState()
     val isOperating by viewModel.isOperating.collectAsState()
+    val recalcInProgress by viewModel.recalcInProgress.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
     val syncProgress by viewModel.syncProgress.collectAsState()
     val logEntries by viewModel.logEntries.collectAsState()
     val pairedMac by viewModel.pairedMac.collectAsState()
     val pairedDeviceName by viewModel.pairedDeviceName.collectAsState()
     val selectedScaleModel by viewModel.selectedScaleModel.collectAsState()
-    val selectedBodyAlgorithm by viewModel.selectedBodyAlgorithm.collectAsState()
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = PermissionController.createRequestPermissionResultContract()
     ) { granted ->
-        if (granted.isNotEmpty()) {
-            Toast.makeText(context, "已获得系统健康权限！", Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(context, "未获得健康读写权限", Toast.LENGTH_SHORT).show()
+        // Health Connect 权限页把「允许读取」「允许写入」分成两栏，用户很容易只勾一边。
+        // 分别判断并给出可执行的提示，避免出现「授权了但同步没反应」。
+        val writeWeight = androidx.health.connect.client.permission.HealthPermission.getWritePermission(
+            androidx.health.connect.client.records.WeightRecord::class
+        )
+        val writeFat = androidx.health.connect.client.permission.HealthPermission.getWritePermission(
+            androidx.health.connect.client.records.BodyFatRecord::class
+        )
+        val writeGranted = granted.contains(writeWeight) && granted.contains(writeFat)
+        val readGranted = granted.size > 2
+
+        val msg = when {
+            writeGranted && readGranted -> "已获得体重/体脂读写权限"
+            writeGranted -> "已获得写入权限（未开读取，自检无法回读条数）"
+            granted.isEmpty() -> "未获得任何健康权限"
+            else -> "只给了读取权限，无法写入——请重试并勾选「允许写入」中的体重、体脂"
         }
+        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
     }
 
     LaunchedEffect(statusMessage) {
@@ -1090,18 +1188,17 @@ fun ProfileScreen(
 
     ProfileContent(
         members = members,
-        onAddMember = { name, sex, height, birth, weight -> viewModel.addMember(name, sex, height, birth, weight) },
+        onAddMember = { name, sex, height, age -> viewModel.addMember(name, sex, height, age) },
+        onUpdateMember = { member, name, sex, height, age ->
+            viewModel.updateMember(member, name, sex, height, age)
+        },
         onDeleteMember = { viewModel.deleteMember(it) },
-        onUpdateMember = { viewModel.updateMember(it) },
-        onRecalculateHistory = { viewModel.recalculateAllHistory() },
         onResetPairing = { viewModel.resetPairing() },
         onNavigateToPairing = onNavigateToPairing,
         pairedMac = pairedMac,
         pairedDeviceName = pairedDeviceName,
         selectedScaleModel = selectedScaleModel,
         onSelectScaleModel = { viewModel.selectScaleModel(it) },
-        selectedBodyAlgorithm = selectedBodyAlgorithm,
-        onSelectBodyAlgorithm = { viewModel.selectBodyAlgorithm(it) },
         healthConnectEnabled = healthConnectEnabled,
         onToggleHealthConnect = { enabled ->
             viewModel.setHealthConnectEnabled(enabled)
@@ -1143,6 +1240,8 @@ fun ProfileScreen(
         onTestWebdavConnection = { url, user, pass -> viewModel.testWebdavConnection(url, user, pass) },
         onBackupData = { viewModel.backupData() },
         onRestoreData = { viewModel.restoreData() },
+        onRecalculateHistory = { viewModel.recalculateHistory() },
+        recalcInProgress = recalcInProgress,
         isOperating = isOperating,
         logEntries = logEntries,
         onClearLogs = { viewModel.clearLogs() },

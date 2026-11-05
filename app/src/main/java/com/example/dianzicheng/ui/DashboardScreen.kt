@@ -80,11 +80,7 @@ fun DashboardContent(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                // 仅在出现测量结果卡片（内容确实超出屏幕）时才允许滚动，空闲状态下首页保持固定
-                .then(
-                    if (uiState.currentMeasurement != null) Modifier.verticalScroll(rememberScrollState())
-                    else Modifier
-                )
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
@@ -165,9 +161,7 @@ fun DashboardContent(
                 }
             }
 
-            if (uiState.currentMeasurement != null) {
-                Spacer(modifier = Modifier.height(16.dp))
-            }
+            Spacer(modifier = Modifier.height(16.dp))
 
             // Action Button / Binding Guidance Card
             if (!uiState.isDeviceRemembered) {
@@ -300,7 +294,7 @@ fun DashboardContent(
                 }
             }
 
-            Spacer(modifier = Modifier.height(if (uiState.currentMeasurement != null) 32.dp else 8.dp))
+            Spacer(modifier = Modifier.height(32.dp))
         }
     }
 
@@ -526,9 +520,12 @@ fun MeasurementResultCard(
             Spacer(modifier = Modifier.height(16.dp))
 
             val hasBia = measurement.impedanceOhm > 0.0 && measurement.bodyFatPct > 0.0
-            // 从成员列表查找性别，用于体脂率健康区间判断（男女标准不同）
-            val isMale = availableMembers.firstOrNull { it.id == measurement.memberId }
-                ?.sex == com.example.dianzicheng.domain.Sex.MALE
+            // 从成员列表查找性别，用于体脂率/水分健康区间判断（男女标准不同）。
+            // 注意：未绑定成员（memberId 为空）时查不到档案，此时不给状态判定——
+            // 原实现用 `?.sex == MALE` 会得到 false，把男性记录一律按女性阈值判，导致 25% 体脂被判"标准"。
+            val memberProfile = availableMembers.firstOrNull { it.id == measurement.memberId }
+            val isMale = memberProfile?.sex == com.example.dianzicheng.domain.Sex.MALE
+            val canJudge = hasBia && memberProfile != null
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -543,13 +540,13 @@ fun MeasurementResultCard(
                 MetricItem(
                     label = "体脂率",
                     value = if (hasBia) String.format("%.1f%%", measurement.bodyFatPct) else "--",
-                    status = if (hasBia) getFatStatus(measurement.bodyFatPct, isMale) else null,
+                    status = if (canJudge) getFatStatus(measurement.bodyFatPct, isMale) else null,
                     modifier = Modifier.weight(1f)
                 )
                 MetricItem(
                     label = "水分",
                     value = if (hasBia) String.format("%.1f%%", measurement.waterPct) else "--",
-                    status = if (hasBia && measurement.waterPct in 50.0..65.0) "标准" else if (hasBia) "注意" else null,
+                    status = if (canJudge) getWaterStatus(measurement.waterPct, isMale) else null,
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -563,13 +560,49 @@ fun MeasurementResultCard(
                 MetricItem("骨量", if (hasBia) String.format("%.1fkg", measurement.boneMassKg) else "--", modifier = Modifier.weight(1f))
             }
             Spacer(modifier = Modifier.height(16.dp))
+            // 骨骼肌与 BMR 只用体重/身高/年龄/性别（Janssen、Mifflin 均为人群式），无阻抗也能出，
+            // 因此单独用自身数值判断，不受 hasBia 限制
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceAround
             ) {
                 MetricItem(
+                    label = "骨骼肌",
+                    value = if (measurement.skeletalMuscleKg > 0.0)
+                        String.format("%.1fkg", measurement.skeletalMuscleKg) else "--",
+                    modifier = Modifier.weight(1f)
+                )
+                MetricItem(
+                    label = "基础代谢",
+                    value = if (measurement.basalMetabolismKcal > 0.0)
+                        String.format("%.0fkcal", measurement.basalMetabolismKcal) else "--",
+                    modifier = Modifier.weight(1f)
+                )
+                MetricItem(
+                    label = "内脏脂肪",
+                    value = if (hasBia) String.format("%.0f级", measurement.visceralFatLevel) else "--",
+                    status = if (hasBia) getVisceralStatus(measurement.visceralFatLevel) else null,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceAround
+            ) {
+                MetricItem(
+                    label = "皮下脂肪",
+                    value = if (hasBia) String.format("%.1f%%", measurement.subcutaneousFatPct) else "--",
+                    modifier = Modifier.weight(1f)
+                )
+                MetricItem(
+                    label = "身体年龄",
+                    value = if (hasBia && measurement.bodyAge > 0) "${measurement.bodyAge}岁" else "--",
+                    modifier = Modifier.weight(1f)
+                )
+                MetricItem(
                     label = "阻抗",
-                    value = if (measurement.impedanceOhm > 0.0) "${measurement.impedanceOhm.toInt()}Ω" else "未测出 (请赤脚称重)",
+                    value = if (measurement.impedanceOhm > 0.0) "${measurement.impedanceOhm.toInt()}Ω" else "--",
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -693,19 +726,55 @@ private fun getBmiStatus(bmi: Double): String = when {
     else -> "肥胖"
 }
 
+/**
+ * 体脂率健康分档（与 Tanita / 华为等主流体脂秤口径一致，介于 ACE 竞技标准与一般健康标准之间）。
+ *
+ * 女性同 BMI 下体脂天然比男性高约 10 个百分点，因此两套阈值不可混用：
+ * 此前女性「<17 偏低、17~30 标准」把 18% 这种运动员水平判成标准、把 31% 判成偏高，
+ * 区间过宽导致几乎所有人都是「标准」，失去参考价值。
+ *
+ * 男性：<10 偏低、10~20 标准、20~25 偏高、≥25 肥胖
+ * 女性：<20 偏低、20~30 标准、30~35 偏高、≥35 肥胖
+ */
 private fun getFatStatus(fat: Double, isMale: Boolean): String = when {
     isMale -> when {
-        fat < 8.0  -> "偏低"
+        fat < 10.0 -> "偏低"
         fat < 20.0 -> "标准"
         fat < 25.0 -> "偏高"
         else       -> "肥胖"
     }
     else -> when {
-        fat < 17.0 -> "偏低"
+        fat < 20.0 -> "偏低"
         fat < 30.0 -> "标准"
         fat < 35.0 -> "偏高"
         else       -> "肥胖"
     }
+}
+
+/**
+ * 体内水分率（TBW 占体重百分比）健康区间。
+ *
+ * 男女的参考区间不同：成年男性约 55~65%，成年女性约 45~60%
+ * （女性脂肪比例天然更高、瘦体重含水量占比相同，故整体占比更低）。
+ * 此前用统一区间 50~65% 判断，会把女性正常值（如 47%）误判为偏低。
+ */
+private fun getWaterStatus(water: Double, isMale: Boolean): String {
+    val range = if (isMale) 55.0..65.0 else 45.0..60.0
+    return when {
+        water < range.start -> "偏低"
+        water > range.endInclusive -> "偏高"
+        else -> "标准"
+    }
+}
+
+/**
+ * 内脏脂肪等级判定（Tanita 口径）：1~9 标准、10~14 偏高、15 以上高。
+ * 该等级为经验估算值（双脚秤无法直接测躯干阻抗），只用于同一个人纵向比较。
+ */
+private fun getVisceralStatus(level: Double): String = when {
+    level <= 9.0 -> "标准"
+    level <= 14.0 -> "偏高"
+    else -> "高"
 }
 
 @Composable
@@ -717,7 +786,12 @@ fun MetricItem(label: String, value: String, status: String? = null, modifier: M
         Text(text = label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
         Text(text = value, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold)
         if (status != null) {
-            val color = if (status == "标准") Color(0xFF4CAF50) else MaterialTheme.colorScheme.error
+            // 标准=绿；偏低/偏瘦=橙（未达正常区间，但不是健康风险）；偏高/超重/肥胖=红
+            val color = when (status) {
+                "标准" -> Color(0xFF4CAF50)
+                "偏低", "偏瘦" -> Color(0xFFFF9800)
+                else -> MaterialTheme.colorScheme.error
+            }
             Surface(
                 color = color.copy(alpha = 0.1f),
                 shape = CircleShape,

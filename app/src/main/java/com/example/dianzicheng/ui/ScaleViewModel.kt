@@ -159,8 +159,37 @@ class ScaleViewModel(
                         selectedMember = updatedSelected
                     )
                 }
+                // 把成员资料同步给秤端：薄荷 B1 等固件必须先收到 10 00 sex age height
+                // 用户参数，才会进入 BIA 测量并推送正式测量帧
+                syncScaleUserParams(_uiState.value.selectedMember ?: members.firstOrNull())
             }
         }
+    }
+
+    /**
+     * 将家庭成员的性别 / 年龄 / 身高同步到蓝牙客户端，用于连接后下发用户参数指令。
+     *
+     * 体脂秤需要通过这些参数在秤端完成 BIA 体成分计算；部分固件（如薄荷 B1
+     * `AFU-BH-TZ-B1`）在收到该指令前只会上报待机采样流，永不产生体重数据。
+     *
+     * @param member 目标成员；为 null 时保持上一次同步的参数不变
+     */
+    private fun syncScaleUserParams(member: FamilyMember?) {
+        if (member == null) return
+        bleClient.userSexCode = if (member.sex == Sex.MALE) 2 else 1
+        bleClient.userHeightCm = member.heightCm.toInt().coerceIn(100, 250)
+        bleClient.userAgeYears = if (member.birthDateEpochMs > 0L) {
+            val now = java.util.Calendar.getInstance()
+            val birth = java.util.Calendar.getInstance().apply { timeInMillis = member.birthDateEpochMs }
+            (now.get(java.util.Calendar.YEAR) - birth.get(java.util.Calendar.YEAR)).coerceIn(1, 120)
+        } else {
+            30
+        }
+        AppLogger.d(
+            TAG,
+            "同步用户参数到秤端: 性别=${bleClient.userSexCode}(1女/2男), " +
+                "年龄=${bleClient.userAgeYears}, 身高=${bleClient.userHeightCm}cm"
+        )
     }
 
     /**
@@ -172,6 +201,7 @@ class ScaleViewModel(
      */
     fun selectMember(member: FamilyMember?) {
         _uiState.update { it.copy(selectedMember = member) }
+        syncScaleUserParams(member)
         val currentMeas = _uiState.value.currentMeasurement
         if (currentMeas != null && member != null) {
             bindCurrentMeasurementToMember(member)
@@ -518,8 +548,7 @@ class ScaleViewModel(
                         impedanceOhm = impedance,
                         sex = targetMember.sex,
                         heightCm = targetMember.heightCm,
-                        birthDateEpochMs = targetMember.birthDateEpochMs,
-                        measuredAtEpochMs = timestamp
+                        birthDateEpochMs = targetMember.birthDateEpochMs
                     )
                 } else {
                     // 没有精确匹配到成员时（如首测新成员、体重差异悬殊、或未建成员）：
@@ -630,13 +659,12 @@ class ScaleViewModel(
             delay(2000)
             try {
                 val enabled = prefs.healthConnectEnabled.first()
-                if (!enabled) return@launch
-                if (!hc.isAvailable()) {
-                    AppLogger.w(TAG, "Health Connect 同步已开启但不可用: ${hc.unavailableReason()}")
-                } else if (!hc.hasWritePermissions()) {
-                    AppLogger.w(TAG, "Health Connect 同步已开启但缺少写入权限，请到“我的”页重新授权")
-                } else {
-                    hc.writeMeasurement(measurement)
+                // 只校验写权限：读权限只用于回读与删除兜底，缺失不该阻断称重后自动同步
+                if (enabled && hc.hasAllPermissions()) {
+                    val ok = hc.writeMeasurement(measurement)
+                    android.util.Log.i(TAG, "Health Connect 自动同步：${if (ok) "成功" else "失败 ${hc.lastWriteError}"}")
+                } else if (enabled) {
+                    android.util.Log.w(TAG, "Health Connect 已开启但缺少写入权限，跳过同步")
                 }
             } catch (e: Exception) {
                 android.util.Log.e(TAG, "Health Connect auto sync failed", e)

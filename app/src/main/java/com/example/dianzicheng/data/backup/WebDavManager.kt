@@ -111,11 +111,12 @@ class WebDavManager(private val dao: ScaleDao) {
                 obj.put("boneMassKg", m.boneMassKg)
                 obj.put("memberId", m.memberId ?: JSONObject.NULL)
                 obj.put("memberNameSnapshot", m.memberNameSnapshot ?: JSONObject.NULL)
-                obj.put("ageUsed", m.ageUsed)
-                obj.put("heightCmUsed", m.heightCmUsed)
-                obj.put("algorithmId", m.algorithmId)
-                obj.put("recalcCount", m.recalcCount)
-                obj.put("lastRecalcAtEpochMs", m.lastRecalcAtEpochMs)
+                // v1.5.0 新增的 5 个派生指标；旧版本备份文件没有这些键，恢复时按 0 处理
+                obj.put("basalMetabolismKcal", m.basalMetabolismKcal)
+                obj.put("skeletalMuscleKg", m.skeletalMuscleKg)
+                obj.put("subcutaneousFatPct", m.subcutaneousFatPct)
+                obj.put("visceralFatLevel", m.visceralFatLevel)
+                obj.put("bodyAge", m.bodyAge)
                 measurementsArray.put(obj)
             }
             jsonRoot.put("measurements", measurementsArray)
@@ -197,11 +198,12 @@ class WebDavManager(private val dao: ScaleDao) {
                             boneMassKg = obj.optDouble("boneMassKg", 0.0),
                             memberId = if (obj.isNull("memberId")) null else obj.optString("memberId").takeIf { it.isNotBlank() },
                             memberNameSnapshot = if (obj.isNull("memberNameSnapshot")) null else obj.optString("memberNameSnapshot").takeIf { it.isNotBlank() },
-                            ageUsed = obj.optInt("ageUsed", 0),
-                            heightCmUsed = obj.optDouble("heightCmUsed", 0.0),
-                            algorithmId = obj.optString("algorithmId", ""),
-                            recalcCount = obj.optInt("recalcCount", 0),
-                            lastRecalcAtEpochMs = obj.optLong("lastRecalcAtEpochMs", 0L)
+                            // 旧备份无这些键 → 0，恢复后可用「重新计算历史体成分」补齐
+                            basalMetabolismKcal = obj.optDouble("basalMetabolismKcal", 0.0),
+                            skeletalMuscleKg = obj.optDouble("skeletalMuscleKg", 0.0),
+                            subcutaneousFatPct = obj.optDouble("subcutaneousFatPct", 0.0),
+                            visceralFatLevel = obj.optDouble("visceralFatLevel", 0.0),
+                            bodyAge = obj.optInt("bodyAge", 0)
                         )
                     )
                 }

@@ -133,6 +133,24 @@ class BleScaleClient(private val context: Context) {
     /** 上次成功配对并记住的设备 MAC 地址。只有该值非空时，才允许自动连接。 */
     var lastPairedMac: String? = null
 
+    // -------------------------------------------------------------------------
+    // 下发给秤端的用户参数（BIA 测量必需）
+    // -------------------------------------------------------------------------
+
+    /**
+     * 用户性别代码：1 = 女，2 = 男（与沃莱 / 薄荷固件的 `0x10` 用户参数指令一致）。
+     *
+     * 体脂率、肌肉量等体成分必须由秤端在测得阻抗后结合性别 / 年龄 / 身高计算，
+     * 因此部分固件（如薄荷 B1）在收到该参数前会一直停留在"待机采样流"，不下发正式测量帧。
+     */
+    var userSexCode: Int = 2
+
+    /** 用户年龄（岁），随 [userSexCode] 一同下发 */
+    var userAgeYears: Int = 30
+
+    /** 用户身高（厘米），随 [userSexCode] 一同下发 */
+    var userHeightCm: Int = 170
+
     /**
      * 是否处于显式手动配对模式。
      * 处于配对模式时，扫描器绝不自动连接任何设备，仅将符合特征的设备收集至 [discoveredScales] 供用户手动选择。
@@ -170,6 +188,13 @@ class BleScaleClient(private val context: Context) {
      */
     fun detectMatchedModel(deviceName: String?, scanRecord: android.bluetooth.le.ScanRecord?): ScaleModel {
         val name = deviceName ?: ""
+        // 薄荷健康 B1（沃莱新固件）必须排在通用 AFU 之前判断，
+        // 否则 AFU-BH-TZ-B1 会被 0xAC 旧协议分支抢走，导致握手协议选错。
+        if (name.contains("AFU-BH", ignoreCase = true) ||
+            name.contains("BH-TZ", ignoreCase = true) ||
+            name.contains("AFU_BH", ignoreCase = true)) {
+            return ScaleModel.AFU_BH_TZ_B1
+        }
         // 优先检查 Service UUID 是否包含 AFU 专属服务 (0xFFB0)，或设备名明确包含 AFU/WL-TZ/TZ-A1
         if (scanRecord?.serviceUuids?.any { it.uuid.toString().uppercase().contains("FFB0") } == true ||
             name.contains("AFU", ignoreCase = true) ||
@@ -339,8 +364,6 @@ class BleScaleClient(private val context: Context) {
             name.startsWith("C08", ignoreCase = true) ||
             name.startsWith("C09", ignoreCase = true) ||
             name.startsWith("C10", ignoreCase = true) ||
-            name.contains("志高", ignoreCase = true) ||
-            name.contains("CHIGO", ignoreCase = true) ||
             name.contains("合泰", ignoreCase = true)
         } == true
         if (nameMatched) return true
@@ -860,6 +883,14 @@ class BleScaleClient(private val context: Context) {
         // 取消无数据超时定时器
         inactivityRunnable?.let { handler.removeCallbacks(it) }
         inactivityRunnable = null
+        // 清空初始化指令队列与诊断样本
+        pendingWriteQueue.clear()
+        writeTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        writeTimeoutRunnable = null
+        writeInFlight = false
+        stopAfuBhSession()
+        stableHoldUntilMs = 0L
+        ScaleFrameDiagnostics.reset()
         // 取消待执行的连接任务与看门狗
         pendingConnectRunnable?.let { handler.removeCallbacks(it) }
         pendingConnectRunnable = null
@@ -972,63 +1003,297 @@ class BleScaleClient(private val context: Context) {
     private var pendingSubscribeIndex = 0
 
     /**
-     * 向所有具有可写属性的特征发送 AFU 协议握手包。
+     * 待下发的初始化指令队列（串行发送，BLE 同一时刻只允许一个 write 在途）。
      *
-     * 握手数据包格式（10 字节）：
-     *   FD 37 00 00 00 00 00 00 00 37
-     * 发送握手是 AFU 体脂秤开始推送体重 + 阻抗数据的必要前提。
-     *
-     * 兼容处理：
-     * - Android 13+（TIRAMISU）：使用新 API [BluetoothGatt.writeCharacteristic]。
-     * - 旧版本：使用已废弃的 [BluetoothGattCharacteristic.value] + [BluetoothGatt.writeCharacteristic]。
-     *
-     * @param gatt 当前 GATT 连接实例。
+     * @property characteristic 目标特征
+     * @property payload        指令字节
+     * @property label          日志用的可读名称
      */
-    private fun sendHandshake(gatt: BluetoothGatt) {
-        for (service in gatt.services) {
-            val sUuid = service.uuid.toString().uppercase()
-            // 仅对 AFU 私有服务 (0xFFB0) 发送 AFU 私有协议握手包，
-            // 严禁向 OKOK、SIG 标准或其它未知厂商特征发送，以防远端 MCU 异常或断连
-            val isAfuService = sUuid.contains("FFB0") || sUuid.contains("0000FFB0")
-            if (!isAfuService) continue
+    private data class PendingWrite(
+        val characteristic: BluetoothGattCharacteristic,
+        val payload: ByteArray,
+        val label: String
+    )
 
-            // 仅当用户明确将偏好型号手动设置为“薄荷健康/沃莱(非AFU)”时才跳过；
-            // 只要设备包含 0xFFB0 服务（AFU 专属服务），哪怕设备名称带有 QN- 或 Yolanda，也必须发送握手包激活 MCU！
-            if (preferredModel == ScaleModel.BOOHEE_YOLANDA) {
-                AppLogger.d(TAG, "当前偏好型号指定为薄荷健康/沃莱非AFU协议，跳过 AFU 握手包")
-                continue
+    /** 初始化指令队列，全部发送完毕即为空 */
+    private val pendingWriteQueue = mutableListOf<PendingWrite>()
+
+    /** 是否有一次 GATT 写操作正在途中（BLE 同一时刻只允许一个写在途）。 */
+    private var writeInFlight = false
+
+    /** 薄荷 B1（AFU-BH-TZ-B1）新固件协议会话，连接断开时置空。 */
+    private var afuBhSession: AfuBhSession? = null
+
+    /** 驱动 [afuBhSession] 状态迁移的 250ms 节拍器。 */
+    private var afuBhTicker: Runnable? = null
+
+    /**
+     * 锁定结果在「无新数据」时仍保留到的时刻（单调时钟毫秒）。
+     *
+     * 薄荷 B1 在握手/应答完成后会停止推送，界面上刚测出的数字不能因此被 2.5 秒看门狗抹掉。
+     */
+    private var stableHoldUntilMs = 0L
+
+    /** 单条写入超时看门狗 */
+    private var writeTimeoutRunnable: Runnable? = null
+
+    /** AFU 旧固件（0xFFB0 服务）握手包：FD 37 00 00 00 00 00 00 00 37 */
+    private val AFU_LEGACY_HANDSHAKE = byteArrayOf(
+        0xFD.toByte(), 0x37, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x37
+    )
+
+    /** 判断是否为无需下发的通用系统服务（GAP / GATT / 设备信息 / 电池 / 时间） */
+    private fun isSystemService(serviceUuid: String): Boolean {
+        val u = serviceUuid.uppercase()
+        return u.startsWith("00001800") || u.startsWith("00001801") ||
+            u.startsWith("0000180A") || u.startsWith("0000180F") ||
+            u.startsWith("00001805") || u.startsWith("00001812") ||
+            u.startsWith("00001814")
+    }
+
+    /**
+     * 把特征的属性位掩码翻译成可读字符串，便于在 GATT 服务树日志中快速识别
+     * 哪个特征可写（下发指令）、哪个可通知（接收数据）。
+     *
+     * @param properties [BluetoothGattCharacteristic.properties] 位掩码
+     * @return 形如 "READ|WRITE|NOTIFY"
+     */
+    private fun describeProperties(properties: Int): String {
+        val sb = StringBuilder()
+        if (properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) sb.append("READ|")
+        if (properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) sb.append("WRITE|")
+        if (properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) sb.append("WRITE_NO_RSP|")
+        if (properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) sb.append("NOTIFY|")
+        if (properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) sb.append("INDICATE|")
+        if (properties and BluetoothGattCharacteristic.PROPERTY_SIGNED_WRITE != 0) sb.append("SIGNED_WRITE|")
+        return if (sb.isEmpty()) "NONE" else sb.toString().trimEnd('|')
+    }
+
+    /**
+     * 连接建立后向秤端下发初始化指令。
+     *
+     * 按固件分成两条互斥分支：
+     *
+     * **A. 薄荷 B1 新固件（写入特征 = `af000002-...`）**
+     * 交给 [AfuBhSession] 处理：校时 → 同步帧1 → 同步帧2，之后按
+     * 「实时体重 → 资料帧 → 锁定 ack → 阻抗 ack → 收尾」的顺序逐步推进。
+     * 这套固件对 `10 00 性别 年龄 身高` 与 `FD 37` 完全不响应。
+     *
+     * **B. 旧款 AFU / 沃莱 0xAC 协议**
+     * 遍历所有非系统服务的可写特征，依次下发
+     * 1. `FD 37 00 00 00 00 00 00 00 37`（仅 0xFFB0 服务的 0xFFB1，兼容旧固件）
+     * 2. `10 00 [性别] [年龄] [身高]`（沃莱 / 薄荷固件的用户参数指令，触发 BIA 测量）
+     *
+     * 所有写入均串行执行并打印结果，便于确认指令是否真正送达。
+     *
+     * @param gatt 当前 GATT 连接实例
+     */
+    private fun sendInitSequence(gatt: BluetoothGatt) {
+        stopAfuBhSession()
+        pendingWriteQueue.clear()
+        writeInFlight = false
+        writeTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        writeTimeoutRunnable = null
+
+        // ---- 分支 A：薄荷健康 B1（AFU-BH-TZ-B1，沃莱新固件）----
+        // 该固件的写入特征固定为 af000002-9f2d-4c8a-8d6f-6a7b45f90000，
+        // 走「校时 + 两帧同步」握手，并需要按状态机回 ack。
+        // 旧逻辑（10 00 性别 年龄 身高 / FD 37）对这套固件完全无效，
+        // 真机日志证实：握手包一帧都没发出去，秤端只推待机采样流。
+        val bhWriteChar = gatt.services
+            .flatMap { it.characteristics }
+            .firstOrNull {
+                it.uuid.toString().equals(AfuBhProtocol.WRITE_CHARACTERISTIC_UUID, ignoreCase = true)
             }
+        if (bhWriteChar != null) {
+            startAfuBhSession(bhWriteChar)
+            return
+        }
+
+        // ---- 分支 B：旧款 AFU（0xFFB0）/ 沃莱 0xAC 协议 ----
+        // 用户参数指令：10 00 sex age height
+        val userCmd = byteArrayOf(
+            0x10,
+            0x00,
+            userSexCode.coerceIn(1, 2).toByte(),
+            userAgeYears.coerceIn(1, 120).toByte(),
+            userHeightCm.coerceIn(100, 250).toByte()
+        )
+
+        for (service in gatt.services) {
+            val sUuid = service.uuid.toString()
+            if (isSystemService(sUuid)) continue
+            val isAfuLegacyService = sUuid.uppercase().contains("FFB0")
 
             for (char in service.characteristics) {
                 val props = char.properties
-                val cUuid = char.uuid.toString().uppercase()
-                val isAfuWrite = cUuid.contains("FFB1") || cUuid.contains("0000FFB1")
-                // 只向支持 WRITE 或 WRITE_NO_RESPONSE 的 AFU 写入特征发送握手
-                if (isAfuWrite && (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
-                    props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)) {
+                val canWrite = (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) ||
+                    (props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)
+                if (!canWrite) continue
 
-                    val handshakeData = byteArrayOf(0xFD.toByte(), 0x37, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x37)
-                    val handshakeHex = handshakeData.joinToString(" ") { "%02X".format(it) }
-                    AppLogger.i(TAG, "向 ${char.uuid} 发送握手数据包: $handshakeHex")
-                    val writeType = if (props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0 &&
-                        props and BluetoothGattCharacteristic.PROPERTY_WRITE == 0) {
-                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                    } else {
-                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                    }
-                    char.writeType = writeType
-                    // 根据 Android API 版本选择写入方式
-                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                        gatt.writeCharacteristic(char, handshakeData, writeType)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        char.value = handshakeData
-                        @Suppress("DEPRECATION")
-                        gatt.writeCharacteristic(char)
-                    }
+                if (isAfuLegacyService && preferredModel != ScaleModel.BOOHEE_YOLANDA) {
+                    pendingWriteQueue.add(
+                        PendingWrite(char, AFU_LEGACY_HANDSHAKE, "AFU 旧固件握手 (FD37)")
+                    )
                 }
+                pendingWriteQueue.add(
+                    PendingWrite(char, userCmd, "用户参数 (10 00 sex age height)")
+                )
             }
         }
+
+        if (pendingWriteQueue.isEmpty()) {
+            AppLogger.w(TAG, "未发现任何可写特征，无法下发初始化指令（该固件可能为纯广播/只读）")
+            return
+        }
+        AppLogger.i(
+            TAG,
+            "开始下发初始化指令序列，共 ${pendingWriteQueue.size} 条 " +
+                "(性别=$userSexCode, 年龄=$userAgeYears, 身高=${userHeightCm}cm)"
+        )
+        writeNextPending()
+    }
+
+    /**
+     * 启动薄荷 B1（AFU-BH-TZ-B1）协议会话。
+     *
+     * 会话本身不含任何 Android 依赖，只负责「该发什么帧、什么时候回 ack」；
+     * 指令统一下发到 `af000002` 这一个写特征（该固件只有它收下行数据）。
+     *
+     * @param writeChar 写特征 `af000002-9f2d-4c8a-8d6f-6a7b45f90000`
+     */
+    private fun startAfuBhSession(writeChar: BluetoothGattCharacteristic) {
+        val session = AfuBhSession(
+            age = userAgeYears.coerceIn(1, 120),
+            male = userSexCode == 2,
+            targetKg = 60.0,
+            userSlot = 0,
+            send = { payload, label -> enqueueAfuBhWrite(writeChar, payload, label) },
+            onLog = { message -> AppLogger.i(TAG, "[AFU-BH] $message") }
+        )
+        afuBhSession = session
+        AppLogger.i(
+            TAG,
+            "识别为薄荷 B1 新固件（af000002 写特征），启动 AFU-BH 协议会话 " +
+                "(年龄=${userAgeYears}, 男性=${userSexCode == 2})"
+        )
+        session.start(System.currentTimeMillis() / 1000, android.os.SystemClock.elapsedRealtime())
+        startAfuBhTicker()
+    }
+
+    /**
+     * 把一条 AFU-BH 下行指令压入串行写队列。
+     *
+     * @param char    写特征
+     * @param payload 指令字节
+     * @param label   日志标签
+     */
+    private fun enqueueAfuBhWrite(char: BluetoothGattCharacteristic, payload: ByteArray, label: String) {
+        pendingWriteQueue.add(PendingWrite(char, payload, label))
+        writeNextPending()
+    }
+
+    /**
+     * 启动 AFU-BH 状态机节拍器（250ms 一次）。
+     *
+     * 这台秤有「锁定后静默 2s 才进入收尾」的时序要求，必须由本地定时器推进，
+     * 只靠收包事件驱动会漏掉该迁移。
+     */
+    private fun startAfuBhTicker() {
+        afuBhTicker?.let { handler.removeCallbacks(it) }
+        val ticker = object : Runnable {
+            override fun run() {
+                val session = afuBhSession ?: return
+                session.tick(
+                    android.os.SystemClock.elapsedRealtime(),
+                    System.currentTimeMillis() / 1000
+                )
+                // 会话可能在 tick 里结束，只有仍然存活才继续计时
+                if (afuBhSession === session) handler.postDelayed(this, 250L)
+            }
+        }
+        afuBhTicker = ticker
+        handler.postDelayed(ticker, 250L)
+    }
+
+    /** 结束并清理 AFU-BH 会话与节拍器。 */
+    private fun stopAfuBhSession() {
+        afuBhTicker?.let { handler.removeCallbacks(it) }
+        afuBhTicker = null
+        afuBhSession = null
+    }
+
+    /**
+     * 串行发送初始化指令队列中的下一条。
+     *
+     * BLE 协议要求同一时刻只有一个 GATT 写操作在途，因此必须等
+     * [BluetoothGattCallback.onCharacteristicWrite] 回调后再发下一条；
+     * 为兼容 `WRITE_NO_RESPONSE` 类型不回回调的固件，另设 1.5s 超时兜底。
+     */
+    private fun writeNextPending() {
+        writeTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        writeTimeoutRunnable = null
+
+        // 有写在途时直接返回：AFU-BH 会话会在收到 ack 后连续压入多条指令，
+        // 这里必须挡住并发写，否则会出现两个 write 抢同一个特征导致 status=201/133
+        if (writeInFlight) return
+
+        val gatt = bluetoothGatt
+        val item = if (pendingWriteQueue.isEmpty()) null else pendingWriteQueue.removeAt(0)
+        if (item == null) {
+            AppLogger.i(TAG, "初始化指令序列发送完毕，等待秤端上报测量数据")
+            return
+        }
+        if (gatt == null) {
+            AppLogger.w(TAG, "GATT 已断开，放弃剩余初始化指令")
+            pendingWriteQueue.clear()
+            return
+        }
+
+        val char = item.characteristic
+        val props = char.properties
+        val writeType = if ((props and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0) {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        }
+        char.writeType = writeType
+
+        writeInFlight = true
+        val ok = try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(char, item.payload, writeType) ==
+                    android.bluetooth.BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                char.value = item.payload
+                @Suppress("DEPRECATION")
+                gatt.writeCharacteristic(char)
+            }
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "下发 ${item.label} 异常: ${e.message}")
+            false
+        }
+
+        AppLogger.i(
+            TAG,
+            "下发 ${item.label} → ${char.uuid}: ${ScaleFrameDiagnostics.hexOf(item.payload)} " +
+                "writeType=$writeType 结果=$ok"
+        )
+
+        if (!ok) {
+            // 立即失败，直接尝试下一条
+            writeInFlight = false
+            writeNextPending()
+            return
+        }
+        val timeout = Runnable {
+            AppLogger.w(TAG, "写入回调超时 (1.5s)：${char.uuid}，继续下一条")
+            writeInFlight = false
+            writeNextPending()
+        }
+        writeTimeoutRunnable = timeout
+        handler.postDelayed(timeout, 1500L)
     }
 
     /**
@@ -1058,9 +1323,9 @@ class BleScaleClient(private val context: Context) {
             // 服务发现及全部特征订阅顺利完成，取消看门狗
             connectTimeoutRunnable?.let { handler.removeCallbacks(it) }
             connectTimeoutRunnable = null
-            // 稍作微小延迟 150ms 确保 BLE 描述符写入事务完全完成，再执行握手写入
+            // 稍作微小延迟 150ms 确保 BLE 描述符写入事务完全完成，再执行初始化指令写入
             handler.postDelayed({
-                sendHandshake(gatt)
+                sendInitSequence(gatt)
             }, 150L)
             _connectionState.value = ConnectionState.CONNECTED
             return
@@ -1125,92 +1390,6 @@ class BleScaleClient(private val context: Context) {
      */
     private var inactivityRunnable: Runnable? = null
 
-    /** 当前 QN 会话的 protocolType；为 null 表示尚未收到 0x12 / 0x14 握手帧。 */
-    private var qnProtocolType: Int? = null
-
-    /** 本次测量是否已发送过 0x1F 完成确认，避免对重复的稳定帧反复回复。 */
-    private var qnFinishAckSent = false
-
-    /**
-     * 向 QN 秤的写入特征（FFE3 / FFE2 / FFF2）写入一帧数据。
-     *
-     * @return 是否成功发起写入。
-     */
-    private fun writeQnFrame(frame: ByteArray, label: String): Boolean {
-        val gatt = bluetoothGatt ?: return false
-        for (service in gatt.services) {
-            if (service.uuid !in QnProtocol.SERVICE_UUIDS) continue
-            val target = QnProtocol.WRITE_UUID_CANDIDATES
-                .firstNotNullOfOrNull { service.getCharacteristic(it) } ?: continue
-            val props = target.properties
-            val writeType = if (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            } else {
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            }
-            AppLogger.i(TAG, "QN ACK [$label] -> ${target.uuid}: ${frame.joinToString(" ") { "%02X".format(it) }}")
-            val ok = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(target, frame, writeType) == android.bluetooth.BluetoothStatusCodes.SUCCESS
-            } else {
-                target.writeType = writeType
-                @Suppress("DEPRECATION")
-                target.value = frame
-                @Suppress("DEPRECATION")
-                gatt.writeCharacteristic(target)
-            }
-            if (!ok) AppLogger.w(TAG, "QN ACK [$label] 写入发起失败")
-            return ok
-        }
-        AppLogger.w(TAG, "QN ACK [$label] 未找到可写特征 (FFE3/FFE2/FFF2)")
-        return false
-    }
-
-    /**
-     * 处理 QN（薄荷健康 / 轻牛 / 沃莱）协议帧并回复 ACK。
-     *
-     * @return Pair(first = 该帧是否已被 QN 逻辑消费, second = 0x10 体重帧解析结果)；
-     *         控制帧 (0x12 / 0x14) 仅回复 ACK，不产生测量值。
-     */
-    private fun handleQnFrame(data: ByteArray, charUuid: String, hexStr: String): Pair<Boolean, MultiScalePacketParser.ParsedScaleData?> {
-        val none = Pair(false, null as MultiScalePacketParser.ParsedScaleData?)
-        if (preferredModel != ScaleModel.AUTO && preferredModel != ScaleModel.BOOHEE_YOLANDA &&
-            preferredModel != ScaleModel.OTHER_GENERIC) return none
-        if (!QnProtocol.isNotifyUuid(charUuid) || !QnProtocol.isQnFrame(data)) return none
-
-        val cmd = data[0].toInt() and 0xFF
-        val proto = QnProtocol.protocolTypeOf(data)
-        when (cmd) {
-            QnProtocol.CMD_CONFIG_REQUEST -> {
-                AppLogger.i(TAG, "收到 QN 配置请求 0x12: $hexStr，回复 0x13")
-                qnProtocolType = proto
-                qnFinishAckSent = false
-                writeQnFrame(QnProtocol.buildConfigAck(proto), "0x13")
-                return Pair(true, null)
-            }
-            QnProtocol.CMD_READY -> {
-                AppLogger.i(TAG, "收到 QN 就绪帧 0x14: $hexStr，回复 0x20 时间同步")
-                qnProtocolType = proto
-                writeQnFrame(QnProtocol.buildTimeSync(proto), "0x20")
-                return Pair(true, null)
-            }
-            QnProtocol.CMD_WEIGHT -> {
-                // 仅在已完成 QN 握手或用户明确选择薄荷/沃莱时才按 QN 体重帧解析，避免与 OKOK 等 0x10 帧混淆
-                if (qnProtocolType == null && preferredModel != ScaleModel.BOOHEE_YOLANDA) return none
-                val result = QnProtocol.parseWeightFrame(data) ?: return none
-                if (result.isStable && result.weightKg >= 3.0) {
-                    if (!qnFinishAckSent) {
-                        qnFinishAckSent = true
-                        writeQnFrame(QnProtocol.buildFinishAck(qnProtocolType ?: proto), "0x1F")
-                    }
-                } else {
-                    qnFinishAckSent = false
-                }
-                return Pair(true, result)
-            }
-        }
-        return none
-    }
-
     /**
      * 处理从 GATT 特征通知中接收到的原始数据包。
      *
@@ -1226,25 +1405,49 @@ class BleScaleClient(private val context: Context) {
      */
     private fun handleIncomingData(data: ByteArray, charUuid: String) {
         // 将原始数据格式化为十六进制字符串打印，记录原始蓝牙数据
-        val hexStr = data.joinToString(" ") { "%02X".format(it) }
-        // 薄荷健康 / 轻牛 / 沃莱 (QN) 协议：必须对 0x12 / 0x14 / 0x10 帧回复 ACK，秤才会继续推送数据
-        val qnResult = handleQnFrame(data, charUuid, hexStr)
-        val scaleResult = if (qnResult.first) qnResult.second
-            else MultiScalePacketParser.parseNotification(data, charUuid, preferredModel)
+        val hexStr = ScaleFrameDiagnostics.hexOf(data)
+        // 短 UUID 标记：日志里必须能区分数据来自哪个特征
+        // （薄荷 B1 同时订阅了 af000003 / af000004 / 00001531 三个通知特征，
+        //   不加标记就无法判断哪一路才是真正的测量通道）
+        val shortUuid = ScaleFrameDiagnostics.shortUuid(charUuid)
+        val scaleResult = MultiScalePacketParser.parseNotification(data, charUuid, preferredModel)
 
-        val parsedDetails = buildString {
-            if (scaleResult != null) {
+        // 把 AFU-BH 帧喂给协议状态机：该发资料帧就发、该回 ack 就回。
+        // 真机日志证实：不回 ack 时秤端会把同一条结果记录连续重发数百次直到断连。
+        afuBhSession?.let { session ->
+            AfuBhProtocol.parse(data)?.let { frame ->
+                session.onFrame(
+                    frame,
+                    android.os.SystemClock.elapsedRealtime(),
+                    System.currentTimeMillis() / 1000
+                )
+            }
+        }
+
+        if (scaleResult == null) {
+            AppLogger.d(TAG, "未识别报文 [特征 $shortUuid]: $hexStr")
+            // 交给诊断探针做字段级统计，便于后续一次性定标偏移与换算系数
+            ScaleFrameDiagnostics.observe(charUuid, data)
+        } else {
+            val parsedDetails = buildString {
                 append(" [${scaleResult.protocolName}] | 体重=${String.format(Locale.US, "%.2f", scaleResult.weightKg)}kg, 锁定=${scaleResult.isStable}")
                 if (scaleResult.impedanceOhm != null) {
                     append(", 阻抗=${scaleResult.impedanceOhm.toInt()}Ω")
                 }
             }
+            AppLogger.d(TAG, "收到原始蓝牙数据 [特征 $shortUuid]: $hexStr$parsedDetails")
         }
-        AppLogger.d(TAG, "收到原始蓝牙数据: $hexStr$parsedDetails")
 
         // 重置 2.5s 无数据包超时定时器（下秤停测后，自动重置状态，确保下一次称重生成全新记录）
         inactivityRunnable?.let { handler.removeCallbacks(it) }
         val watchdog = Runnable {
+            // 薄荷 B1 在收到 ack 之后会安静下来（不再发任何帧），若此时仍按「无数据即下秤」处理，
+            // 刚测出的体重会在 2.5 秒后从界面上消失。因此只要本轮结果已锁定且仍在保留期内，就不清零。
+            val nowMs = android.os.SystemClock.elapsedRealtime()
+            if (_isStable.value && _weight.value >= 3.0 && nowMs < stableHoldUntilMs) {
+                inactivityRunnable?.let { handler.postDelayed(it, 2500L) }
+                return@Runnable
+            }
             AppLogger.d(TAG, "无数据超时 (2.5s): 用户已下秤，重置测量状态")
             // 超时后将所有测量状态重置为 0，为下次称重做准备
             _weight.value = 0.0
@@ -1265,6 +1468,8 @@ class BleScaleClient(private val context: Context) {
                 val validStable = result.isStable && (result.weightKg >= 3.0)
                 _isStable.value = validStable
                 if (validStable) {
+                    // 锁定结果保留 60 秒，避免秤端静默后被看门狗清零
+                    stableHoldUntilMs = android.os.SystemClock.elapsedRealtime() + 60_000L
                     // 体重稳定锁定后切换到测量状态，通知 UI 开始体成分计算
                     _connectionState.value = ConnectionState.MEASURING
                 } else {
@@ -1285,10 +1490,8 @@ class BleScaleClient(private val context: Context) {
 
             result.impedanceOhm?.let { imp ->
                 // 人体生物电阻抗（BIA）必须基于真实人体踩秤（体重 >= 3.0kg）才能测得，空秤时禁止接收阻抗
-                if (ImpedanceGate.accept(imp, result.isStable, result.weightKg, _weight.value)) {
+                if (imp > 0.0 && (_weight.value >= 3.0 || result.weightKg >= 3.0)) {
                     _impedance.value = imp
-                } else if (imp > 0.0) {
-                    AppLogger.d(TAG, "丢弃非锁定帧/空载帧中的阻抗 ${imp.toInt()}Ω (frameStable=${result.isStable}, 体重=${String.format(Locale.US, "%.2f", result.weightKg)}kg)")
                 }
             }
         }
@@ -1379,10 +1582,15 @@ class BleScaleClient(private val context: Context) {
                 if (bluetoothGatt == gatt) {
                     bluetoothGatt = null
                 }
+                pendingWriteQueue.clear()
+                writeTimeoutRunnable?.let { handler.removeCallbacks(it) }
+                writeTimeoutRunnable = null
+                writeInFlight = false
+                stopAfuBhSession()
+                stableHoldUntilMs = 0L
+                ScaleFrameDiagnostics.reset()
                 pendingSubscribeList.clear()
                 pendingSubscribeIndex = 0
-                qnProtocolType = null
-                qnFinishAckSent = false
 
                 // 区分是"正常测量完成后的设备休眠断开"还是"连接发起阶段的握手失败"
                 val wasPreviouslyConnected = _connectionState.value == ConnectionState.CONNECTED ||
@@ -1467,6 +1675,29 @@ class BleScaleClient(private val context: Context) {
                 // 清空订阅队列，准备重新收集
                 pendingSubscribeList.clear()
                 pendingSubscribeIndex = 0
+                // 清空上一轮残留的初始化指令与诊断样本
+                pendingWriteQueue.clear()
+                writeInFlight = false
+                stopAfuBhSession()
+                ScaleFrameDiagnostics.reset()
+
+                // 【诊断】打印完整 GATT 服务 / 特征树。
+                // 排查"服务 UUID 不含 0xFFB0 导致握手发不出""哪个特征才是真正的数据通道"时，
+                // 这张表是唯一可靠的依据，务必保留。
+                AppLogger.i(TAG, "===== GATT 服务列表开始 (共 ${gatt.services.size} 个服务) =====")
+                for (service in gatt.services) {
+                    AppLogger.i(TAG, "服务 ${service.uuid} [${service.type}]")
+                    for (char in service.characteristics) {
+                        AppLogger.i(
+                            TAG,
+                            "    └ 特征 ${char.uuid} props=0x%02X (%s)".format(
+                                char.properties,
+                                describeProperties(char.properties)
+                            )
+                        )
+                    }
+                }
+                AppLogger.i(TAG, "===== GATT 服务列表结束 =====")
 
                 // 遍历所有 GATT 服务，收集可订阅的特征
                 for (service in gatt.services) {
@@ -1493,6 +1724,28 @@ class BleScaleClient(private val context: Context) {
                 // 开始串行订阅流程（第一个特征）
                 subscribeNextCharacteristic(gatt)
             }
+        }
+
+        /**
+         * GATT 特征写入完成回调。
+         *
+         * 初始化指令（握手包 / 用户参数）均为串行下发，收到本回调表示上一条已送达，
+         * 立即继续发送队列中的下一条；失败也会继续，避免单条指令卡死整个序列。
+         *
+         * @param gatt        GATT 客户端实例
+         * @param characteristic 已完成写入的特征
+         * @param status      写入结果状态码
+         */
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            AppLogger.d(TAG, "写入完成: status=$status, 特征: ${characteristic.uuid}")
+            writeTimeoutRunnable?.let { handler.removeCallbacks(it) }
+            writeTimeoutRunnable = null
+            writeInFlight = false
+            writeNextPending()
         }
 
         /**

@@ -118,13 +118,6 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        lifecycleScope.launch {
-            preferenceManager.selectedBodyAlgorithm.collect { algoId ->
-                com.example.dianzicheng.domain.BodyAlgorithm.currentAlgorithm =
-                    com.example.dianzicheng.domain.BodyAlgorithmType.fromId(algoId)
-            }
-        }
-
         val filter = android.content.IntentFilter(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED)
         registerReceiver(bluetoothReceiver, filter)
 
@@ -188,12 +181,13 @@ class MainActivity : ComponentActivity() {
     private fun checkPermissions() {
         val permissions = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Android 12+：只要「附近的设备」权限。
+            // 清单里 BLUETOOTH_SCAN 已声明 neverForLocation，系统不会再要求定位权限，
+            // 也不需要用户打开系统定位开关。
             permissions.add(Manifest.permission.BLUETOOTH_SCAN)
             permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
-            // 未声明 neverForLocation 时需要定位权限以捕获厂商广播数据包
-            permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
-            permissions.add(Manifest.permission.ACCESS_COARSE_LOCATION)
         } else {
+            // Android 11 及以下：系统强制要求定位权限才能拿到 BLE 扫描结果
             permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
             permissions.add(Manifest.permission.ACCESS_COARSE_LOCATION)
         }

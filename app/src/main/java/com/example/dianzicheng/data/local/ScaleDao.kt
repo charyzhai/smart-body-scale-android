@@ -60,6 +60,19 @@ interface ScaleDao {
     fun getMeasurementsForMember(memberId: String): Flow<List<MeasurementEntity>>
 
     /**
+     * 获取指定成员**最近一次**测量记录（按称重时间倒序取第一条）。
+     *
+     * 用于改绑成员时判断本次改绑的是不是该成员的最新记录：
+     * 只有最新记录才允许刷新成员的参考体重，否则用几个月前的历史体重
+     * 覆盖当前参考体重，会让下一次自动匹配整体跑偏。
+     *
+     * @param memberId 成员 ID
+     * @return 最新记录，该成员没有任何记录时返回 null
+     */
+    @Query("SELECT * FROM measurements WHERE memberId = :memberId ORDER BY measuredAtEpochMs DESC LIMIT 1")
+    suspend fun getLatestMeasurementForMember(memberId: String): MeasurementEntity?
+
+    /**
      * 插入或覆盖更新测量记录。
      * REPLACE 冲突策略确保同一 sessionId（主键）的记录只保存最新版本：
      * - 第一次写入：仅有体重数据，体脂等为 0

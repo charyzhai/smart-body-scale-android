@@ -108,6 +108,11 @@ object MultiScalePacketParser {
 
         val uuidStr = charUuid?.uppercase() ?: ""
 
+        // 优先分支 0：薄荷健康 B1（AFU-BH-TZ-B1，沃莱新固件）的 20 字节 `AF 45` 帧。
+        // 有帧头魔数 + 低 5 位校验双保险，不会与任何既有协议冲突，因此放在最前面：
+        // 即便用户把偏好型号选成「沃莱 AFU 私有协议」，也能正确命中。
+        parseAfuBh(data)?.let { return it }
+
         // 优先分支 1：用户明确指定了偏好型号，优先执行该型号的专属解析
         when (preferredModel) {
             ScaleModel.AFU_PROTOCOL -> parseAfu(data)?.let { return it }
@@ -244,9 +249,7 @@ object MultiScalePacketParser {
                 name.contains("薄荷", ignoreCase = true) ||
                 name.contains("Fitdays", ignoreCase = true) ||
                 name.contains("Senssun", ignoreCase = true) ||
-                name.contains("香山", ignoreCase = true) ||
-                name.contains("志高", ignoreCase = true) ||
-                name.contains("CHIGO", ignoreCase = true)
+                name.contains("香山", ignoreCase = true)
             } == true
 
             val hasScaleService = serviceUuidStrings.any { u ->
@@ -494,6 +497,63 @@ object MultiScalePacketParser {
     // 协议 1：AFU 协议解析
     // -------------------------------------------------------------------------
 
+    /**
+     * 解析薄荷健康 B1（`AFU-BH-TZ-B1`）的 20 字节 `AF 45` 新固件协议帧。
+     *
+     * 三类帧都会产出可用数据：
+     *
+     * | 类型 | 含义 | 体重 | 阻抗 | 稳定 |
+     * |---|---|---|---|---|
+     * | `0x51` | 实时体重 | 18 位克数 | 无 | bit31 |
+     * | `0x54` | 结果/历史记录 | 18 位克数 | 有 | 恒为 true |
+     * | `0x52` | 独立阻抗帧 | 无（返回 0） | 有 | false |
+     *
+     * `0x52` 帧返回 `weightKg = 0.0` 且 `impedanceOhm != null`，
+     * 调用方（[com.example.dianzicheng.data.ble.BleScaleClient]）对此有专门分支：
+     * 只更新阻抗、绝不清零已锁定的体重。
+     *
+     * @param data 原始通知字节
+     * @return 解析结果；非本协议帧或不可用帧返回 null
+     */
+    private fun parseAfuBh(data: ByteArray): ParsedScaleData? {
+        if (data.size != AfuBhProtocol.FRAME_SIZE) return null
+        if ((data[0].toInt() and 0xFF) != AfuBhProtocol.HEAD_0) return null
+        if ((data[1].toInt() and 0xFF) != AfuBhProtocol.HEAD_1) return null
+
+        return when (val frame = AfuBhProtocol.parse(data)) {
+            is AfuBhProtocol.LiveWeight -> ParsedScaleData(
+                weightKg = frame.weightGrams / 1000.0,
+                isStable = frame.locked && frame.weightGrams >= 3000,
+                impedanceOhm = null,
+                protocolName = "AFU-BH/B1"
+            )
+
+            is AfuBhProtocol.StoredRecord -> {
+                if (frame.weightGrams <= 0) return null
+                ParsedScaleData(
+                    weightKg = frame.weightGrams / 1000.0,
+                    isStable = frame.locked && frame.weightGrams >= 3000,
+                    impedanceOhm = frame.resistanceOhm.takeIf { it in 100..3000 }?.toDouble(),
+                    protocolName = "AFU-BH/B1 记录"
+                )
+            }
+
+            is AfuBhProtocol.Impedance -> {
+                if (!frame.valid) return null
+                val ohm = frame.resistanceOhm
+                if (ohm !in 100..3000) return null
+                ParsedScaleData(
+                    weightKg = 0.0,
+                    isStable = false,
+                    impedanceOhm = ohm.toDouble(),
+                    protocolName = "AFU-BH/B1 阻抗"
+                )
+            }
+
+            else -> null
+        }
+    }
+
     private fun parseAfu(data: ByteArray): ParsedScaleData? {
         val weightData = AFUPacketParser.parseWeight(data) ?: return null
         // 仅当示数已稳定锁定（weightData.isStable）且体重 >= 3.0kg 时，阻抗才具备生理意义且允许读取；
@@ -528,6 +588,10 @@ object MultiScalePacketParser {
         if (data.size < 3) return null
 
         val flags = data[0].toInt() and 0xFF
+        // SIG 规范中 0x2A9D 的 Flags 仅定义 Bit0~Bit4（单位 / 时间戳 / 用户 ID / BMI 身高），
+        // Bit5~Bit7 为保留位必须为 0。若出现保留位，说明该报文是厂商私有帧
+        // （例如薄荷 B1 的 AF 45 ... 首字节 0xAF），绝不可按 SIG 标准体重解析。
+        if (flags and 0xE0 != 0) return null
         val isImperial = (flags and 0x01) != 0
 
         val rawWeight = (data[1].toInt() and 0xFF) or ((data[2].toInt() and 0xFF) shl 8)

@@ -720,6 +720,74 @@ class MultiScalePacketParserTest {
         assertTrue("状态位 0x04 必须判定为稳定锁定状态", result3!!.isStable)
         assertEquals(584.0, result3.impedanceOhm!!, 0.1)
     }
+
+    @Test
+    fun testBooheeB1Af45FrameParsedAsAfuBhOnly() {
+        // 薄荷 B1（AFU-BH-TZ-B1）真实上报帧：20 字节，帧头 AF 45。
+        // 期望值来自 2026-10-29 真机日志，逐帧人工核对过：
+        //   8.25kg / 0.00kg（空秤）/ 58.10kg
+        val cases = listOf(
+            "AF 45 3A 20 08 00 02 80 01 88 38 4B 00 00 00 00 00 00 51 01" to 8.25,
+            "AF 45 00 00 08 00 02 80 01 88 38 4B 00 00 00 00 00 00 51 07" to 0.00,
+            "AF 45 F4 E2 08 00 02 80 01 88 38 4B 00 00 00 00 00 00 51 1D" to 58.10
+        )
+        val uuids = listOf(
+            "AF000003-9F2D-4C8A-8D6F-6A7B45F90000",
+            "AF000004-9F2D-4C8A-8D6F-6A7B45F90000",
+            "00001531-1212-EFDE-1523-785FEABCD123"
+        )
+        for ((hex, expectedKg) in cases) {
+            val data = hex.split(" ").map { it.toInt(16).toByte() }.toByteArray()
+            for (uuid in uuids) {
+                for (model in ScaleModel.values()) {
+                    val result = MultiScalePacketParser.parseNotification(data, uuid, model)
+                    assertNotNull("帧 $hex / 特征 $uuid / 型号 $model 应当被 AFU-BH 解析", result)
+                    assertTrue(
+                        "帧 $hex 只能由 AFU-BH 协议认领，实际被 ${result!!.protocolName} 抢走",
+                        result.protocolName.startsWith("AFU-BH")
+                    )
+                    assertEquals("帧 $hex 体重错误", expectedKg, result.weightKg, 0.001)
+                    // 未锁定帧不得报稳定，否则 UI 会提前触发体成分计算
+                    assertFalse("帧 $hex 未锁定却报稳定", result.isStable)
+                }
+                // AF45 是连接后的通知帧，不应在广播解析里被当成体重
+                assertNull(
+                    "帧 $hex / 特征 $uuid 在 AUTO 模式广播解析中被误判",
+                    MultiScalePacketParser.parseAdvertisementBytes(data, null, emptyList())
+                )
+            }
+        }
+    }
+
+    @Test
+    fun testBooheeB1LockedFrameAndResultRecord() {
+        // 锁定帧：bit31 = 1 → 稳定，77.45kg
+        val locked = "AF 45 8A 2E 09 80 02 80 01 88 38 4B 00 00 00 00 00 00 51 00"
+            .split(" ").map { it.toInt(16).toByte() }.toByteArray()
+        val lockedResult = MultiScalePacketParser.parseNotification(locked, "AF000003-9F2D-4C8A-8D6F-6A7B45F90000")
+        assertNotNull(lockedResult)
+        assertEquals(77.45, lockedResult!!.weightKg, 0.001)
+        assertTrue("bit31 置位的帧必须判定为稳定锁定", lockedResult.isStable)
+
+        // 结果记录帧（0x54）：体重 77.45kg + 阻抗 461Ω，秤端会一直重发等待 ack
+        val record = "AF 45 00 BE 33 E3 6A 8A 2E 09 80 00 01 CD 01 00 00 00 54 02"
+            .split(" ").map { it.toInt(16).toByte() }.toByteArray()
+        val recordResult = MultiScalePacketParser.parseNotification(record, "AF000003-9F2D-4C8A-8D6F-6A7B45F90000")
+        assertNotNull(recordResult)
+        assertEquals(77.45, recordResult!!.weightKg, 0.001)
+        assertEquals("结果记录里的阻抗必须被取出", 461.0, recordResult.impedanceOhm!!, 0.1)
+        assertTrue(recordResult.isStable)
+    }
+
+    @Test
+    fun testBooheeB1RejectsCorruptedChecksum() {
+        // 篡改校验位后必须拒收，防止噪声帧被当成体重
+        val corrupted = "AF 45 8A 2E 09 80 02 80 01 88 38 4B 00 00 00 00 00 00 51 05"
+            .split(" ").map { it.toInt(16).toByte() }.toByteArray()
+        assertNull(
+            MultiScalePacketParser.parseNotification(corrupted, "AF000003-9F2D-4C8A-8D6F-6A7B45F90000")
+        )
+    }
 }
 
 

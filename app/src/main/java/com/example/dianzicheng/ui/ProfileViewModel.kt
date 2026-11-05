@@ -8,8 +8,7 @@ import com.example.dianzicheng.data.local.AppLogger
 import com.example.dianzicheng.data.local.PreferenceManager
 import com.example.dianzicheng.data.repository.ProfileRepository
 import com.example.dianzicheng.data.repository.ScaleRepository
-import com.example.dianzicheng.domain.BodyAlgorithm
-import com.example.dianzicheng.domain.BodyAlgorithmType
+import com.example.dianzicheng.domain.AgeUtils
 import com.example.dianzicheng.domain.FamilyMember
 import com.example.dianzicheng.domain.ScaleModel
 import com.example.dianzicheng.domain.Sex
@@ -17,7 +16,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -73,24 +71,6 @@ class ProfileViewModel(
         }
     }
 
-    // ── 体成分计算算法设置 ────────────────────────────────────────────────────
-
-    /** 当前选中的体成分算法（来自 DataStore，默认商业对标模式） */
-    val selectedBodyAlgorithm: StateFlow<BodyAlgorithmType> = preferenceManager.selectedBodyAlgorithm
-        .map { BodyAlgorithmType.fromId(it) }
-        .stateIn(viewModelScope, SharingStarted.Lazily, BodyAlgorithmType.COMMERCIAL)
-
-    /**
-     * 保存用户选择的体成分算法偏好
-     */
-    fun selectBodyAlgorithm(algorithm: BodyAlgorithmType) {
-        viewModelScope.launch {
-            preferenceManager.saveSelectedBodyAlgorithm(algorithm.id)
-            BodyAlgorithm.currentAlgorithm = algorithm
-            AppLogger.i("ProfileVM", "已切换体成分算法为: ${algorithm.displayName} (${algorithm.id})")
-        }
-    }
-
     // ── Health Connect 设置 ───────────────────────────────────────────────────
 
     /** Health Connect 自动同步开关状态（来自 DataStore） */
@@ -138,76 +118,77 @@ class ProfileViewModel(
     private val _syncProgress = MutableStateFlow<String?>(null)
     val syncProgress: StateFlow<String?> = _syncProgress.asStateFlow()
 
+    /**
+     * 历史体成分重算是否正在进行。
+     *
+     * 与 [isOperating] 分开是为了让设置页只有「重新计算」这一项显示 loading，
+     * 不会连带把 WebDAV 备份/恢复按钮一起置灰。
+     */
+    private val _recalcInProgress = MutableStateFlow(false)
+    val recalcInProgress: StateFlow<Boolean> = _recalcInProgress.asStateFlow()
+
     // ── 家庭成员管理 ─────────────────────────────────────────────────────────
 
     /**
      * 添加新家庭成员并保存到数据库。
      *
-     * @param name            成员姓名
-     * @param sex             性别
-     * @param heightCm        身高（厘米）
-     * @param birthDateEpochMs 出生日期（Unix 毫秒时间戳）
-     * @param weightKg        初始参考体重（公斤），首次添加时通常为 0.0
+     * @param name     成员姓名
+     * @param sex      性别
+     * @param heightCm 身高（厘米）
+     * @param age      年龄（周岁），由 [AgeUtils] 换算成出生日期后落库
      */
-    fun addMember(name: String, sex: Sex, heightCm: Double, birthDateEpochMs: Long, weightKg: Double) {
+    fun addMember(name: String, sex: Sex, heightCm: Double, age: Int) {
         viewModelScope.launch {
             val member = FamilyMember(
                 id = UUID.randomUUID().toString(), // 生成全局唯一 ID
                 name = name,
                 sex = sex,
                 heightCm = heightCm,
-                birthDateEpochMs = birthDateEpochMs,
-                referenceWeightKg = weightKg
+                birthDateEpochMs = AgeUtils.birthDateFromAge(age),
+                referenceWeightKg = 0.0
             )
             repository.saveMember(member)
+            _statusMessage.value = "已添加成员「${member.name}」"
         }
     }
 
     /**
-     * 修改家庭成员资料（姓名/性别/身高/年龄等），并重算该成员名下的全部历史记录。
+     * 修改已有成员的资料（姓名 / 性别 / 身高 / 年龄），并自动重算其历史记录。
      *
-     * 历史记录的年龄按各自称重时刻推算，原始体重/阻抗/时间不变；每条记录会记录重算次数与时间。
+     * 性别、身高、年龄都是体成分公式的直接输入：改完不重算，历史数值就会停留在旧档案口径，
+     * 出现「成员档案写着 40 岁、几个月前的身体年龄还是按 25 岁算」这种自相矛盾。
+     * 因此保存后立即对该成员的历史记录做一次重算（只影响本人，不牵连其他成员）。
+     *
+     * @param member 原成员对象（用于保留 id 与参考体重）
+     * @param name 新姓名
+     * @param sex 新性别
+     * @param heightCm 新身高（厘米）
+     * @param age 新年龄（周岁）
      */
-    fun updateMember(member: FamilyMember) {
+    fun updateMember(member: FamilyMember, name: String, sex: Sex, heightCm: Double, age: Int) {
         viewModelScope.launch {
-            val old = members.value.firstOrNull { it.id == member.id }
-            repository.saveMember(member)
-            val changedProfile = old == null || old.sex != member.sex ||
-                old.heightCm != member.heightCm || old.birthDateEpochMs != member.birthDateEpochMs ||
-                old.name != member.name
-            if (!changedProfile) return@launch
-            val repo = scaleRepository ?: return@launch
-            try {
-                val n = repo.recalculateForMember(member, selectedBodyAlgorithm.value)
-                AppLogger.i("ProfileVM", "成员 ${member.name} 资料已更新，已重算 $n 条历史记录")
-                _statusMessage.value = "已更新 ${member.name}，并重算 $n 条历史记录"
-            } catch (e: Exception) {
-                AppLogger.e("ProfileVM", "成员资料更新后重算失败: ${e.message}")
-                _statusMessage.value = "资料已保存，但历史重算失败：${e.localizedMessage}"
-            }
-        }
-    }
+            val updated = member.copy(
+                name = name,
+                sex = sex,
+                heightCm = heightCm,
+                birthDateEpochMs = AgeUtils.birthDateFromAge(age)
+            )
+            repository.saveMember(updated)
 
-    /**
-     * 以当前算法与各成员最新资料重算全部历史记录（手动触发，例如切换算法之后）。
-     */
-    fun recalculateAllHistory() {
-        val repo = scaleRepository ?: run {
-            _statusMessage.value = "无法访问数据库"
-            return
-        }
-        viewModelScope.launch {
-            _isOperating.value = true
-            try {
-                val algorithm = selectedBodyAlgorithm.value
-                val n = repo.recalculateAll(algorithm)
-                AppLogger.i("ProfileVM", "已按 ${algorithm.displayName} 重算 $n 条历史记录")
-                _statusMessage.value = "已按「${algorithm.displayName}」重算 $n 条历史记录"
+            val summary = try {
+                scaleRepository?.recalculateMeasurementsForMember(member.id)
             } catch (e: Exception) {
-                AppLogger.e("ProfileVM", "历史重算失败: ${e.message}")
-                _statusMessage.value = "历史重算失败：${e.localizedMessage}"
-            } finally {
-                _isOperating.value = false
+                AppLogger.e("ProfileVM", "成员资料更新后重算历史失败: ${e.message}")
+                null
+            }
+            _statusMessage.value = buildString {
+                append("已更新「$name」的资料")
+                if (summary != null && summary.updated > 0) {
+                    append("，并重算 ${summary.updated} 条历史记录")
+                }
+                if (summary != null && summary.total > summary.updated) {
+                    append("（${summary.total - summary.updated} 条无阻抗数据未重算）")
+                }
             }
         }
     }
@@ -215,46 +196,6 @@ class ProfileViewModel(
     /** 从数据库删除指定家庭成员 */
     fun deleteMember(member: FamilyMember) {
         viewModelScope.launch { repository.deleteMember(member) }
-    }
-
-    fun upsertPrimaryMember(
-        name: String,
-        sex: Sex,
-        heightCm: Double,
-        birthDateEpochMs: Long
-    ) {
-        viewModelScope.launch {
-            try {
-                // 现查一次库，拿到当前成员列表（而不是复用 members.value，
-                // 因为该 StateFlow 是 Lazily 启动的，本页未被打开时其值只是初始空列表）
-                val existing = repository.getMembers().first()
-                val untouchedDefault = existing.singleOrNull()
-                    ?.takeIf { it.name == "自己" && it.referenceWeightKg <= 0.0 }
-
-                val member = if (untouchedDefault != null) {
-                    AppLogger.i("FirstRunProfile", "覆盖默认成员「自己」为: $name, ${heightCm}cm")
-                    untouchedDefault.copy(
-                        name = name,
-                        sex = sex,
-                        heightCm = heightCm,
-                        birthDateEpochMs = birthDateEpochMs
-                    )
-                } else {
-                    AppLogger.i("FirstRunProfile", "新增成员: $name, ${heightCm}cm")
-                    FamilyMember(
-                        id = UUID.randomUUID().toString(),
-                        name = name,
-                        sex = sex,
-                        heightCm = heightCm,
-                        birthDateEpochMs = birthDateEpochMs,
-                        referenceWeightKg = 0.0
-                    )
-                }
-                repository.saveMember(member)
-            } catch (e: Exception) {
-                AppLogger.e("FirstRunProfile", "保存基础信息失败: ${e.message}")
-            }
-        }
     }
 
     /** 清除已配对的蓝牙设备 MAC 地址，触发重新配对流程 */
@@ -293,11 +234,13 @@ class ProfileViewModel(
         }
         viewModelScope.launch {
             if (!hcManager.isAvailable()) {
-                _statusMessage.value = hcManager.unavailableReason() ?: "当前设备不支持 Health Connect"
+                _statusMessage.value = "当前设备不支持 Health Connect，请升级系统或安装 Health Connect 应用"
                 return@launch
             }
-            if (!hcManager.hasWritePermissions()) {
-                _statusMessage.value = "请先在上方开启\"同步至系统健康\"并授予权限，再进行批量同步"
+            // 只校验写权限：此前要求读写四项全给，用户漏勾一项就同步不了，
+            // 而写入本身只需要 WRITE_WEIGHT / WRITE_BODY_FAT。
+            if (!hcManager.hasAllPermissions()) {
+                _statusMessage.value = "缺少 Health Connect 写入权限，请点「申请健康中心读写权限」并勾选「允许写入」"
                 return@launch
             }
             _isOperating.value = true
@@ -315,9 +258,10 @@ class ProfileViewModel(
                 _syncProgress.value = null
                 _isOperating.value = false
                 _statusMessage.value = if (failed == 0) {
-                    "✅ 成功同步 $success 条数据！小米健康将自动读取这些数据。"
+                    "已写入 $success 条记录到 Health Connect"
                 } else {
-                    "同步完成：成功 $success 条，失败 $failed 条"
+                    val reason = hcManager.lastWriteError?.let { "（$it）" } ?: ""
+                    "同步完成：成功 $success 条，失败 $failed 条$reason"
                 }
             } catch (e: Exception) {
                 _syncProgress.value = null
@@ -403,6 +347,37 @@ class ProfileViewModel(
             val result = manager.restoreData(url, user, pass)
             _isOperating.value = false
             _statusMessage.value = result.getOrElse { it.localizedMessage }
+        }
+    }
+
+    // ── 历史数据维护 ──────────────────────────────────────────────────────────
+
+    /**
+     * 用当前体成分算法与成员档案，一次性重算全部历史记录的派生指标。
+     *
+     * 适用场景：算法公式修正后，让历史记录与新记录口径一致，避免趋势图断层。
+     * 只刷新 BMI / 体脂率 / 水分 / 蛋白质 / 骨量 / 肌肉量，
+     * 体重、阻抗、称重时间、成员绑定关系均保持原值。
+     *
+     * 结果通过 [statusMessage] 以 Toast 形式反馈（含更新条数与跳过原因）。
+     */
+    fun recalculateHistory() {
+        val repo = scaleRepository
+        if (repo == null) {
+            _statusMessage.value = "数据仓库未初始化，无法重算"
+            return
+        }
+        if (_recalcInProgress.value) return
+        viewModelScope.launch {
+            _recalcInProgress.value = true
+            val summary = try {
+                repo.recalculateAllMeasurements()
+            } catch (e: Exception) {
+                AppLogger.e("ProfileVM", "历史体成分重算失败: ${e.message}")
+                null
+            }
+            _recalcInProgress.value = false
+            _statusMessage.value = summary?.describe() ?: "重算失败，请查看运行日志"
         }
     }
 

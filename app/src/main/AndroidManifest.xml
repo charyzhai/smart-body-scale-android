@@ -5,10 +5,23 @@
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!--
+        定位权限仅 Android 11 及以下需要：
+        BLE 扫描在 API ≤ 30 上被系统强制要求 ACCESS_FINE_LOCATION（且系统定位开关必须打开）。
+        Android 12+ 只需「附近的设备」运行时权限，下面的 maxSdkVersion="30" 会阻止
+        新系统上再向用户索要定位权限。详见 BLUETOOTH_SCAN 的 neverForLocation 声明。
+    -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="30" />
+    <!--
+        neverForLocation：向系统声明「扫描结果不用于推断地理位置」。
+        不加这个标记时，系统会认为本应用可能由蓝牙信号推算位置，从而在 Android 12+
+        上仍然强制要求定位权限（这正是此前必须打开定位才能连上秤的原因）。
+        本应用只读体重/阻抗，不涉及任何位置推断，因此可以安全声明。
+    -->
     <uses-permission
         android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
         tools:targetApi="s" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
@@ -51,18 +64,6 @@
                 <action android:name="androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" />
             </intent-filter>
         </activity>
-
-        <!-- Android 14+：Health Connect 已并入系统，须声明权限使用说明入口，否则权限申请弹窗可能无法弹出 -->
-        <activity-alias
-            android:name="ViewPermissionUsageActivity"
-            android:exported="true"
-            android:permission="android.permission.START_VIEW_PERMISSION_USAGE"
-            android:targetActivity=".MainActivity">
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW_PERMISSION_USAGE" />
-                <category android:name="android.intent.category.HEALTH_PERMISSIONS" />
-            </intent-filter>
-        </activity-alias>
     </application>
 
 </manifest>

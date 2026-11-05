@@ -46,11 +46,11 @@ fun MeasurementEntity.toDomain() = BodyMeasurement(
     boneMassKg = boneMassKg,
     memberId = memberId,
     memberNameSnapshot = memberNameSnapshot,
-    ageUsed = ageUsed,
-    heightCmUsed = heightCmUsed,
-    algorithmId = algorithmId,
-    recalcCount = recalcCount,
-    lastRecalcAtEpochMs = lastRecalcAtEpochMs
+    basalMetabolismKcal = basalMetabolismKcal,
+    skeletalMuscleKg = skeletalMuscleKg,
+    subcutaneousFatPct = subcutaneousFatPct,
+    visceralFatLevel = visceralFatLevel,
+    bodyAge = bodyAge
 )
 
 /** 将领域模型 [BodyMeasurement] 转换为数据库实体 [MeasurementEntity]，用于持久化存储 */
@@ -67,9 +67,9 @@ fun BodyMeasurement.toEntity() = MeasurementEntity(
     boneMassKg = boneMassKg,
     memberId = memberId,
     memberNameSnapshot = memberNameSnapshot,
-    ageUsed = ageUsed,
-    heightCmUsed = heightCmUsed,
-    algorithmId = algorithmId,
-    recalcCount = recalcCount,
-    lastRecalcAtEpochMs = lastRecalcAtEpochMs
+    basalMetabolismKcal = basalMetabolismKcal,
+    skeletalMuscleKg = skeletalMuscleKg,
+    subcutaneousFatPct = subcutaneousFatPct,
+    visceralFatLevel = visceralFatLevel,
+    bodyAge = bodyAge
 )

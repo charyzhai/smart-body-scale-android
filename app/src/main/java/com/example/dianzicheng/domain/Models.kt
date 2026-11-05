@@ -34,18 +34,18 @@ data class FamilyMember(
  * @param weightKg            体重（公斤）
  * @param impedanceOhm        体内阻抗（欧姆），0.0 表示本次未测出
  * @param bmi                 体质指数 = 体重 / 身高²
- * @param bodyFatPct          体脂率（%），仅当有有效阻抗时计算
- * @param muscleKg            肌肉量（公斤），仅当有有效阻抗时计算
- * @param waterPct            体内水分率（%），仅当有有效阻抗时计算
- * @param proteinPct          蛋白质率（%），仅当有有效阻抗时计算
- * @param boneMassKg          骨量（公斤），仅当有有效阻抗时计算
+ * @param bodyFatPct          体脂率（%），Deurenberg 1991 与 Lukaski 1988 双式互校，仅当有有效阻抗时计算
+ * @param muscleKg            肌肉量（公斤）= 去脂体重 − 骨量，仅当有有效阻抗时计算
+ * @param waterPct            体内水分率（%）= 0.73 × 去脂体重 / 体重，仅当有有效阻抗时计算
+ * @param proteinPct          蛋白质率（%）= 0.194 × 去脂体重 / 体重，仅当有有效阻抗时计算
+ * @param boneMassKg          骨量（公斤）= 0.052 × 去脂体重，仅当有有效阻抗时计算
+ * @param basalMetabolismKcal 基础代谢率（kcal/天）：有阻抗用 Katch-McArdle，无阻抗用 Mifflin-St Jeor
+ * @param skeletalMuscleKg    骨骼肌量（公斤），Janssen 2000 人群方程，不依赖阻抗
+ * @param subcutaneousFatPct  皮下脂肪率（%）= 0.80 × 体脂率，仅当有有效阻抗时计算
+ * @param visceralFatLevel    内脏脂肪等级（1~30，≤9 正常），经验映射，仅供趋势参考
+ * @param bodyAge             身体年龄（岁），由体脂率相对同龄参考值的偏离折算，0 表示未计算
  * @param memberId            关联的家庭成员 ID，null 表示未绑定成员
  * @param memberNameSnapshot  记录保存时的成员姓名快照（防止成员改名后历史数据混乱）
- * @param ageUsed             计算指标时采用的年龄（按称重时刻推算），0 表示未记录
- * @param heightCmUsed        计算指标时采用的身高（厘米），0 表示未记录
- * @param algorithmId         计算指标时采用的算法 ID（[BodyAlgorithmType.id]），空串表示未记录
- * @param recalcCount         该记录被重新计算的次数（成员资料或算法变更触发）
- * @param lastRecalcAtEpochMs 最近一次重算时间，0 表示从未重算
  */
 data class BodyMeasurement(
     val id: String,
@@ -60,9 +60,9 @@ data class BodyMeasurement(
     val boneMassKg: Double,
     val memberId: String?,
     val memberNameSnapshot: String?,
-    val ageUsed: Int = 0,
-    val heightCmUsed: Double = 0.0,
-    val algorithmId: String = "",
-    val recalcCount: Int = 0,
-    val lastRecalcAtEpochMs: Long = 0L,
+    val basalMetabolismKcal: Double = 0.0,
+    val skeletalMuscleKg: Double = 0.0,
+    val subcutaneousFatPct: Double = 0.0,
+    val visceralFatLevel: Double = 0.0,
+    val bodyAge: Int = 0,
 )
